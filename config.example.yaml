@@ -67,6 +67,22 @@ error-logs-max-files: 10
 # When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
 
+# Persistent request tracing.
+# When enabled, CLIProxyAPI stores structured request / attempt / usage facts in SQLite
+# and writes large or streaming bodies to tracing/bodies/.
+tracing:
+  enabled: false
+  # Base directory for tracing.db and tracing/bodies/. Relative paths resolve from config.yaml.
+  dir: './tracing'
+  # Keep payloads inline in SQLite until they exceed this size, then spill to files.
+  body-inline-max-bytes: 65536
+  # Maximum captured bytes per body. 0 means no truncation.
+  max-body-bytes: 0
+  # Emit SSE notifications after tracing events are committed to SQLite.
+  emit-sse: true
+  # Remove old tracing data when > 0. 0 disables automatic pruning.
+  prune-days: 0
+
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 proxy-url: ''
 

@@ -18,6 +18,7 @@ import (
 
 // aiAPIPrefixes defines path prefixes for AI API requests that should have request ID tracking.
 var aiAPIPrefixes = []string{
+	"/v1/models",
 	"/v1/chat/completions",
 	"/v1/completions",
 	"/v1/messages",

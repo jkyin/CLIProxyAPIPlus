@@ -64,6 +64,9 @@ type Config struct {
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
+	// Tracing configures persistent high-fidelity request tracing.
+	Tracing TracingConfig `yaml:"tracing" json:"tracing"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -179,6 +182,22 @@ type RemoteManagement struct {
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
+}
+
+// TracingConfig controls persistent tracing capture and retention.
+type TracingConfig struct {
+	// Enabled toggles SQLite-backed request tracing.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Dir is the base directory where tracing.db and blob spool files are stored.
+	Dir string `yaml:"dir" json:"dir"`
+	// BodyInlineMaxBytes keeps small payloads inline in SQLite; larger bodies spill to files.
+	BodyInlineMaxBytes int64 `yaml:"body-inline-max-bytes" json:"body-inline-max-bytes"`
+	// MaxBodyBytes truncates captured bodies when > 0. Zero means no truncation.
+	MaxBodyBytes int64 `yaml:"max-body-bytes" json:"max-body-bytes"`
+	// EmitSSE enables post-commit SSE notifications for new tracing events.
+	EmitSSE bool `yaml:"emit-sse" json:"emit-sse"`
+	// PruneDays removes old tracing rows and blobs when > 0.
+	PruneDays int `yaml:"prune-days" json:"prune-days"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.
@@ -604,6 +623,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.LogsMaxTotalSizeMB = 0
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
+	cfg.Tracing = TracingConfig{
+		Enabled:            false,
+		Dir:                "./tracing",
+		BodyInlineMaxBytes: 64 * 1024,
+		MaxBodyBytes:       0,
+		EmitSSE:            true,
+		PruneDays:          0,
+	}
 	cfg.DisableCooling = false
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
@@ -668,6 +695,19 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
+	}
+
+	if strings.TrimSpace(cfg.Tracing.Dir) == "" {
+		cfg.Tracing.Dir = "./tracing"
+	}
+	if cfg.Tracing.BodyInlineMaxBytes <= 0 {
+		cfg.Tracing.BodyInlineMaxBytes = 64 * 1024
+	}
+	if cfg.Tracing.MaxBodyBytes < 0 {
+		cfg.Tracing.MaxBodyBytes = 0
+	}
+	if cfg.Tracing.PruneDays < 0 {
+		cfg.Tracing.PruneDays = 0
 	}
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.

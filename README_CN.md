@@ -6,6 +6,11 @@
 
 所有的第三方供应商支持都由第三方社区维护者提供，CLIProxyAPI 不提供技术支持。如需取得支持，请与对应的社区维护者联系。
 
+## Tracing 文档
+
+- 请求追踪集成: [docs/tracing-integration_CN.md](docs/tracing-integration_CN.md)
+- 请求追踪接口样例: [docs/tracing-api-examples_CN.md](docs/tracing-api-examples_CN.md)
+
 ## 贡献
 
 该项目仅接受第三方供应商支持的 Pull Request。任何非第三方供应商支持的 Pull Request 都将被拒绝。

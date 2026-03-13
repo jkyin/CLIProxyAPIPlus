@@ -30,6 +30,10 @@ auths/*
 
 # Documentation
 docs/*
+!docs/tracing-integration.md
+!docs/tracing-integration_CN.md
+!docs/tracing-api-examples.md
+!docs/tracing-api-examples_CN.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md

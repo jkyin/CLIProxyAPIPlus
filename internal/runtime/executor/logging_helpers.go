@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/tracing"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -51,135 +52,215 @@ type upstreamAttempt struct {
 
 // recordAPIRequest stores the upstream request metadata in Gin context for request logging.
 func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequestLog) {
-	if cfg == nil || !cfg.RequestLog {
-		return
-	}
-	ginCtx := ginContextFrom(ctx)
-	if ginCtx == nil {
-		return
+	if cfg != nil && cfg.RequestLog {
+		ginCtx := ginContextFrom(ctx)
+		if ginCtx != nil {
+			attempts := getAttempts(ginCtx)
+			index := len(attempts) + 1
+
+			builder := &strings.Builder{}
+			builder.WriteString(fmt.Sprintf("=== API REQUEST %d ===\n", index))
+			builder.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
+			if info.URL != "" {
+				builder.WriteString(fmt.Sprintf("Upstream URL: %s\n", info.URL))
+			} else {
+				builder.WriteString("Upstream URL: <unknown>\n")
+			}
+			if info.Method != "" {
+				builder.WriteString(fmt.Sprintf("HTTP Method: %s\n", info.Method))
+			}
+			if auth := formatAuthInfo(info); auth != "" {
+				builder.WriteString(fmt.Sprintf("Auth: %s\n", auth))
+			}
+			builder.WriteString("\nHeaders:\n")
+			writeHeaders(builder, info.Headers)
+			builder.WriteString("\nBody:\n")
+			if len(info.Body) > 0 {
+				builder.WriteString(string(info.Body))
+			} else {
+				builder.WriteString("<empty>")
+			}
+			builder.WriteString("\n\n")
+
+			attempt := &upstreamAttempt{
+				index:    index,
+				request:  builder.String(),
+				response: &strings.Builder{},
+			}
+			attempts = append(attempts, attempt)
+			ginCtx.Set(apiAttemptsKey, attempts)
+			updateAggregatedRequest(ginCtx, attempts)
+		}
 	}
 
-	attempts := getAttempts(ginCtx)
-	index := len(attempts) + 1
-
-	builder := &strings.Builder{}
-	builder.WriteString(fmt.Sprintf("=== API REQUEST %d ===\n", index))
-	builder.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
-	if info.URL != "" {
-		builder.WriteString(fmt.Sprintf("Upstream URL: %s\n", info.URL))
-	} else {
-		builder.WriteString("Upstream URL: <unknown>\n")
+	state := tracing.RequestStateFromContext(ctx)
+	if state != nil {
+		if current := state.ActiveAttempt(); current != nil {
+			snapshot := current.Snapshot()
+			if snapshot.RequestBound {
+				tracing.FinishAttempt(ctx, tracing.AttemptFinish{
+					Outcome:      tracing.AttemptOutcomeFailed,
+					FinishedAt:   time.Now().UTC(),
+					ErrorCode:    "executor_internal_retry",
+					ErrorMessage: "superseded by executor internal retry",
+				})
+				nextCtx, nextAttempt, errTrace := tracing.StartAttempt(ctx, tracing.AttemptStart{
+					RetryScope:    "executor_internal_retry",
+					Provider:      snapshot.Provider,
+					ExecutorID:    snapshot.ExecutorID,
+					AuthID:        snapshot.AuthID,
+					AuthIndex:     snapshot.AuthIndex,
+					RouteModel:    snapshot.RouteModel,
+					UpstreamModel: snapshot.UpstreamModel,
+					StartedAt:     time.Now().UTC(),
+				})
+				if errTrace == nil && nextAttempt != nil {
+					ctx = nextCtx
+					state = tracing.RequestStateFromContext(ctx)
+				}
+			}
+		}
+		blobCfg := state.BlobConfig()
+		blobCfg.ContentType = strings.TrimSpace(info.Headers.Get("Content-Type"))
+		blobCfg.ContentEncoding = strings.TrimSpace(info.Headers.Get("Content-Encoding"))
+		record, errBlob := tracing.CollectBlobBytes(blobCfg, info.Body, true)
+		if errBlob == nil && record != nil {
+			_ = state.Recorder().SaveBlob(ctx, record)
+		}
+		tracing.RecordAttemptRequest(ctx, tracing.AttemptRequest{
+			UpstreamURL:       info.URL,
+			UpstreamMethod:    info.Method,
+			UpstreamProtocol:  traceProtocol(info.Method),
+			RequestHeaders:    sanitizedHeaders(info.Headers),
+			RequestBodyBlobID: blobIDOrEmpty(record),
+		})
 	}
-	if info.Method != "" {
-		builder.WriteString(fmt.Sprintf("HTTP Method: %s\n", info.Method))
-	}
-	if auth := formatAuthInfo(info); auth != "" {
-		builder.WriteString(fmt.Sprintf("Auth: %s\n", auth))
-	}
-	builder.WriteString("\nHeaders:\n")
-	writeHeaders(builder, info.Headers)
-	builder.WriteString("\nBody:\n")
-	if len(info.Body) > 0 {
-		builder.WriteString(string(info.Body))
-	} else {
-		builder.WriteString("<empty>")
-	}
-	builder.WriteString("\n\n")
-
-	attempt := &upstreamAttempt{
-		index:    index,
-		request:  builder.String(),
-		response: &strings.Builder{},
-	}
-	attempts = append(attempts, attempt)
-	ginCtx.Set(apiAttemptsKey, attempts)
-	updateAggregatedRequest(ginCtx, attempts)
 }
 
 // recordAPIResponseMetadata captures upstream response status/header information for the latest attempt.
 func recordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
-	if cfg == nil || !cfg.RequestLog {
-		return
-	}
-	ginCtx := ginContextFrom(ctx)
-	if ginCtx == nil {
-		return
-	}
-	attempts, attempt := ensureAttempt(ginCtx)
-	ensureResponseIntro(attempt)
+	if cfg != nil && cfg.RequestLog {
+		ginCtx := ginContextFrom(ctx)
+		if ginCtx != nil {
+			attempts, attempt := ensureAttempt(ginCtx)
+			ensureResponseIntro(attempt)
 
-	if status > 0 && !attempt.statusWritten {
-		attempt.response.WriteString(fmt.Sprintf("Status: %d\n", status))
-		attempt.statusWritten = true
-	}
-	if !attempt.headersWritten {
-		attempt.response.WriteString("Headers:\n")
-		writeHeaders(attempt.response, headers)
-		attempt.headersWritten = true
-		attempt.response.WriteString("\n")
-	}
+			if status > 0 && !attempt.statusWritten {
+				attempt.response.WriteString(fmt.Sprintf("Status: %d\n", status))
+				attempt.statusWritten = true
+			}
+			if !attempt.headersWritten {
+				attempt.response.WriteString("Headers:\n")
+				writeHeaders(attempt.response, headers)
+				attempt.headersWritten = true
+				attempt.response.WriteString("\n")
+			}
 
-	updateAggregatedResponse(ginCtx, attempts)
+			updateAggregatedResponse(ginCtx, attempts)
+		}
+	}
+	tracing.RecordAttemptResponseMeta(ctx, status, sanitizedHeaders(headers))
 }
 
 // recordAPIResponseError adds an error entry for the latest attempt when no HTTP response is available.
 func recordAPIResponseError(ctx context.Context, cfg *config.Config, err error) {
-	if cfg == nil || !cfg.RequestLog || err == nil {
+	if err == nil {
 		return
 	}
-	ginCtx := ginContextFrom(ctx)
-	if ginCtx == nil {
-		return
-	}
-	attempts, attempt := ensureAttempt(ginCtx)
-	ensureResponseIntro(attempt)
+	if cfg != nil && cfg.RequestLog {
+		ginCtx := ginContextFrom(ctx)
+		if ginCtx != nil {
+			attempts, attempt := ensureAttempt(ginCtx)
+			ensureResponseIntro(attempt)
 
-	if attempt.bodyStarted && !attempt.bodyHasContent {
-		// Ensure body does not stay empty marker if error arrives first.
-		attempt.bodyStarted = false
-	}
-	if attempt.errorWritten {
-		attempt.response.WriteString("\n")
-	}
-	attempt.response.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
-	attempt.errorWritten = true
+			if attempt.bodyStarted && !attempt.bodyHasContent {
+				attempt.bodyStarted = false
+			}
+			if attempt.errorWritten {
+				attempt.response.WriteString("\n")
+			}
+			attempt.response.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
+			attempt.errorWritten = true
 
-	updateAggregatedResponse(ginCtx, attempts)
+			updateAggregatedResponse(ginCtx, attempts)
+		}
+	}
+	tracing.FinishAttempt(ctx, tracing.AttemptFinish{
+		Outcome:      tracing.AttemptOutcomeFailed,
+		FinishedAt:   time.Now().UTC(),
+		ErrorCode:    "upstream_error",
+		ErrorMessage: err.Error(),
+	})
 }
 
 // appendAPIResponseChunk appends an upstream response chunk to Gin context for request logging.
 func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byte) {
-	if cfg == nil || !cfg.RequestLog {
-		return
-	}
 	data := bytes.TrimSpace(chunk)
 	if len(data) == 0 {
 		return
 	}
-	ginCtx := ginContextFrom(ctx)
-	if ginCtx == nil {
-		return
-	}
-	attempts, attempt := ensureAttempt(ginCtx)
-	ensureResponseIntro(attempt)
+	if cfg != nil && cfg.RequestLog {
+		ginCtx := ginContextFrom(ctx)
+		if ginCtx != nil {
+			attempts, attempt := ensureAttempt(ginCtx)
+			ensureResponseIntro(attempt)
 
-	if !attempt.headersWritten {
-		attempt.response.WriteString("Headers:\n")
-		writeHeaders(attempt.response, nil)
-		attempt.headersWritten = true
-		attempt.response.WriteString("\n")
-	}
-	if !attempt.bodyStarted {
-		attempt.response.WriteString("Body:\n")
-		attempt.bodyStarted = true
-	}
-	if attempt.bodyHasContent {
-		attempt.response.WriteString("\n\n")
-	}
-	attempt.response.WriteString(string(data))
-	attempt.bodyHasContent = true
+			if !attempt.headersWritten {
+				attempt.response.WriteString("Headers:\n")
+				writeHeaders(attempt.response, nil)
+				attempt.headersWritten = true
+				attempt.response.WriteString("\n")
+			}
+			if !attempt.bodyStarted {
+				attempt.response.WriteString("Body:\n")
+				attempt.bodyStarted = true
+			}
+			if attempt.bodyHasContent {
+				attempt.response.WriteString("\n\n")
+			}
+			attempt.response.WriteString(string(data))
+			attempt.bodyHasContent = true
 
-	updateAggregatedResponse(ginCtx, attempts)
+			updateAggregatedResponse(ginCtx, attempts)
+		}
+	}
+	if attempt := tracing.AttemptStateFromContext(ctx); attempt != nil {
+		attempt.MarkFirstByte(time.Now().UTC())
+		if state := tracing.RequestStateFromContext(ctx); state != nil {
+			blobCfg := state.BlobConfig()
+			blobCfg.PreferFile = true
+			if collector, err := attempt.EnsureResponseCollector(blobCfg); err == nil && collector != nil {
+				_, _ = collector.Write(data)
+			}
+		}
+	}
+}
+
+func blobIDOrEmpty(record *tracing.BlobRecord) string {
+	if record == nil {
+		return ""
+	}
+	return record.BlobID
+}
+
+func traceProtocol(method string) string {
+	if strings.EqualFold(strings.TrimSpace(method), "WEBSOCKET") {
+		return "websocket"
+	}
+	return "http"
+}
+
+func sanitizedHeaders(headers http.Header) http.Header {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(http.Header, len(headers))
+	for key, values := range headers {
+		for _, value := range values {
+			out.Add(key, util.MaskSensitiveHeaderValue(key, value))
+		}
+	}
+	return out
 }
 
 func ginContextFrom(ctx context.Context) *gin.Context {

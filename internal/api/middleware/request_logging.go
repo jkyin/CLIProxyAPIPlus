@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/tracing"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
 
@@ -23,7 +24,8 @@ const maxErrorOnlyCapturedRequestBodyBytes int64 = 1 << 20 // 1 MiB
 // body capture is limited to small known-size payloads to avoid large per-request memory spikes.
 func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if logger == nil {
+		traceState := tracing.RequestStateFromGin(c)
+		if logger == nil && traceState == nil {
 			c.Next()
 			return
 		}
@@ -39,7 +41,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			return
 		}
 
-		loggerEnabled := logger.IsEnabled()
+		loggerEnabled := logger != nil && logger.IsEnabled()
 
 		// Capture request information
 		requestInfo, err := captureRequestInfo(c, shouldCaptureRequestBody(loggerEnabled, c.Request))
@@ -52,6 +54,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 
 		// Create response writer wrapper
 		wrapper := NewResponseWriterWrapper(c.Writer, logger, requestInfo)
+		wrapper.tracingState = traceState
 		if !loggerEnabled {
 			wrapper.logOnErrorOnly = true
 		}

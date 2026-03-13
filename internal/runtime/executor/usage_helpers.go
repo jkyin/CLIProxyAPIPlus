@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/tracing"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
@@ -24,6 +26,7 @@ type usageReporter struct {
 	source      string
 	requestedAt time.Time
 	once        sync.Once
+	observed    atomic.Bool
 }
 
 func newUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *usageReporter {
@@ -47,7 +50,23 @@ func (r *usageReporter) publish(ctx context.Context, detail usage.Detail) {
 }
 
 func (r *usageReporter) publishFailure(ctx context.Context) {
-	r.publishWithOutcome(ctx, usage.Detail{}, true)
+	tracing.MarkUsageFailed(ctx)
+	if r == nil {
+		return
+	}
+	r.once.Do(func() {
+		usage.PublishRecord(ctx, usage.Record{
+			Provider:    r.provider,
+			Model:       r.model,
+			Source:      r.source,
+			APIKey:      r.apiKey,
+			AuthID:      r.authID,
+			AuthIndex:   r.authIndex,
+			RequestedAt: r.requestedAt,
+			Failed:      true,
+			Detail:      usage.Detail{},
+		})
+	})
 }
 
 func (r *usageReporter) trackFailure(ctx context.Context, errPtr *error) {
@@ -72,6 +91,19 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	if detail.InputTokens == 0 && detail.OutputTokens == 0 && detail.ReasoningTokens == 0 && detail.CachedTokens == 0 && detail.TotalTokens == 0 && !failed {
 		return
 	}
+	r.observed.Store(true)
+	tracing.ObserveUsage(ctx, tracing.UsageObservation{
+		Provider:         r.provider,
+		ObservedAt:       time.Now().UTC(),
+		InputTokens:      detail.InputTokens,
+		OutputTokens:     detail.OutputTokens,
+		ReasoningTokens:  detail.ReasoningTokens,
+		CachedTokens:     detail.CachedTokens,
+		TotalTokens:      detail.TotalTokens,
+		DerivedTotal:     detail.TotalTokens == detail.InputTokens+detail.OutputTokens+detail.ReasoningTokens && detail.TotalTokens > 0,
+		IsTerminal:       false,
+		CompletenessHint: tracing.UsageCompletenessPartial,
+	})
 	r.once.Do(func() {
 		usage.PublishRecord(ctx, usage.Record{
 			Provider:    r.provider,
@@ -92,9 +124,14 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 // This is used to ensure request counting even when upstream responses do not
 // include any usage fields (tokens), especially for streaming paths.
 func (r *usageReporter) ensurePublished(ctx context.Context) {
-	if r == nil {
+	if r == nil || r.observed.Load() {
 		return
 	}
+	tracing.ObserveUsage(ctx, tracing.UsageObservation{
+		Provider:         r.provider,
+		ObservedAt:       time.Now().UTC(),
+		CompletenessHint: tracing.UsageCompletenessMissing,
+	})
 	r.once.Do(func() {
 		usage.PublishRecord(ctx, usage.Record{
 			Provider:    r.provider,

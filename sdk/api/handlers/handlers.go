@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/tracing"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -188,12 +189,7 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
 	// It is forwarded as execution metadata; when absent we generate a UUID.
-	key := ""
-	if ctx != nil {
-		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
-		}
-	}
+	key := idempotencyKeyFromContext(ctx)
 	if key == "" {
 		key = uuid.NewString()
 	}
@@ -209,6 +205,16 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
 	return meta
+}
+
+func idempotencyKeyFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		return strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
+	}
+	return ""
 }
 
 func pinnedAuthIDFromContext(ctx context.Context) string {
@@ -473,6 +479,12 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	tracing.UpdateRequestRoute(ctx, tracing.RequestRouteInfo{
+		IsStream:            false,
+		HandlerType:         handlerType,
+		RequestedModel:      normalizedModel,
+		ClientCorrelationID: strings.TrimSpace(idempotencyKeyFromContext(ctx)),
+	})
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -519,6 +531,12 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	tracing.UpdateRequestRoute(ctx, tracing.RequestRouteInfo{
+		IsStream:            false,
+		HandlerType:         handlerType,
+		RequestedModel:      normalizedModel,
+		ClientCorrelationID: strings.TrimSpace(idempotencyKeyFromContext(ctx)),
+	})
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -569,6 +587,12 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
+	tracing.UpdateRequestRoute(ctx, tracing.RequestRouteInfo{
+		IsStream:            true,
+		HandlerType:         handlerType,
+		RequestedModel:      normalizedModel,
+		ClientCorrelationID: strings.TrimSpace(idempotencyKeyFromContext(ctx)),
+	})
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -689,6 +713,14 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 					if !sentPayload {
 						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
 							bootstrapRetries++
+							tracing.RecordHandlerBootstrapRetry(ctx, map[string]any{
+								"retry_scope":     "handler_bootstrap_retry",
+								"retry_index":     bootstrapRetries,
+								"max_retries":     maxBootstrapRetries,
+								"requested_model": normalizedModel,
+								"handler_type":    handlerType,
+								"error":           streamErr.Error(),
+							})
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {
 								if passthroughHeadersEnabled {

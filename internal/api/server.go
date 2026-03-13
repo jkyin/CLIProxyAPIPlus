@@ -28,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/tracing"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -222,8 +223,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		if optionState.requestLoggerFactory != nil {
 			requestLogger = optionState.requestLoggerFactory(cfg, configFilePath)
 		}
+	}
+	if requestLogger != nil || (cfg != nil && cfg.Tracing.Enabled && tracing.Enabled()) {
+		engine.Use(middleware.RequestLoggingMiddleware(requestLogger))
 		if requestLogger != nil {
-			engine.Use(middleware.RequestLoggingMiddleware(requestLogger))
 			if setter, ok := requestLogger.(interface{ SetEnabled(bool) }); ok {
 				toggle = setter.SetEnabled
 			}
@@ -272,6 +275,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if optionState.postAuthHook != nil {
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
 	}
+	s.mgmt.SetTracingRecorder(tracing.DefaultRecorder())
 	s.localPassword = optionState.localPassword
 
 	// Setup routes
@@ -573,6 +577,13 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/request-log", s.mgmt.GetRequestLog)
 		mgmt.PUT("/request-log", s.mgmt.PutRequestLog)
 		mgmt.PATCH("/request-log", s.mgmt.PutRequestLog)
+		mgmt.GET("/tracing/status", s.mgmt.GetTracingStatus)
+		mgmt.GET("/tracing/events", s.mgmt.GetTracingEvents)
+		mgmt.GET("/tracing/requests/:request_id", s.mgmt.GetTracingRequest)
+		mgmt.GET("/tracing/requests/:request_id/attempts", s.mgmt.GetTracingAttempts)
+		mgmt.GET("/tracing/requests/:request_id/usage", s.mgmt.GetTracingUsage)
+		mgmt.GET("/tracing/blobs/:blob_id", s.mgmt.GetTracingBlob)
+		mgmt.GET("/tracing/sse", s.mgmt.TracingSSE)
 		mgmt.GET("/ws-auth", s.mgmt.GetWebsocketAuth)
 		mgmt.PUT("/ws-auth", s.mgmt.PutWebsocketAuth)
 		mgmt.PATCH("/ws-auth", s.mgmt.PutWebsocketAuth)

@@ -6,12 +6,14 @@ package middleware
 import (
 	"bytes"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/tracing"
 )
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
@@ -37,10 +39,11 @@ type ResponseWriterWrapper struct {
 	streamDone          chan struct{}              // streamDone signals when the streaming goroutine completes.
 	logger              logging.RequestLogger      // logger is the instance of the request logger service.
 	requestInfo         *RequestInfo               // requestInfo holds the details of the original request.
-	statusCode          int                        // statusCode stores the HTTP status code of the response.
-	headers             map[string][]string        // headers stores the response headers.
-	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
-	firstChunkTimestamp time.Time                  // firstChunkTimestamp captures TTFB for streaming responses.
+	tracingState        *tracing.RequestState
+	statusCode          int                 // statusCode stores the HTTP status code of the response.
+	headers             map[string][]string // headers stores the response headers.
+	logOnErrorOnly      bool                // logOnErrorOnly enables logging only when an error response is detected.
+	firstChunkTimestamp time.Time           // firstChunkTimestamp captures TTFB for streaming responses.
 }
 
 // NewResponseWriterWrapper creates and initializes a new ResponseWriterWrapper.
@@ -77,6 +80,19 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(data)
 
 	// THEN: Handle logging based on response type
+	if w.tracingState != nil {
+		w.tracingState.MarkResponseFirstByte(time.Now().UTC())
+		if collector, errCollector := w.tracingState.EnsureResponseCollector(tracing.BlobConfig{
+			BaseDir:         filepath.Dir(w.tracingState.Recorder().DBPath()),
+			InlineMaxBytes:  w.tracingState.BlobConfig().InlineMaxBytes,
+			MaxBodyBytes:    w.tracingState.BlobConfig().MaxBodyBytes,
+			PreferFile:      w.isStreaming,
+			ContentType:     strings.TrimSpace(w.ResponseWriter.Header().Get("Content-Type")),
+			ContentEncoding: strings.TrimSpace(w.ResponseWriter.Header().Get("Content-Encoding")),
+		}); errCollector == nil && collector != nil {
+			_, _ = collector.Write(data)
+		}
+	}
 	if w.isStreaming && w.chunkChannel != nil {
 		// Capture TTFB on first chunk (synchronous, before async channel send)
 		if w.firstChunkTimestamp.IsZero() {
@@ -125,6 +141,19 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 	n, err := w.ResponseWriter.WriteString(data)
 
 	// THEN: Capture for logging
+	if w.tracingState != nil {
+		w.tracingState.MarkResponseFirstByte(time.Now().UTC())
+		if collector, errCollector := w.tracingState.EnsureResponseCollector(tracing.BlobConfig{
+			BaseDir:         filepath.Dir(w.tracingState.Recorder().DBPath()),
+			InlineMaxBytes:  w.tracingState.BlobConfig().InlineMaxBytes,
+			MaxBodyBytes:    w.tracingState.BlobConfig().MaxBodyBytes,
+			PreferFile:      w.isStreaming,
+			ContentType:     strings.TrimSpace(w.ResponseWriter.Header().Get("Content-Type")),
+			ContentEncoding: strings.TrimSpace(w.ResponseWriter.Header().Get("Content-Encoding")),
+		}); errCollector == nil && collector != nil {
+			_, _ = collector.Write([]byte(data))
+		}
+	}
 	if w.isStreaming && w.chunkChannel != nil {
 		// Capture TTFB on first chunk (synchronous, before async channel send)
 		if w.firstChunkTimestamp.IsZero() {
@@ -157,7 +186,7 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 	w.isStreaming = w.detectStreaming(contentType)
 
 	// If streaming, initialize streaming log writer
-	if w.isStreaming && w.logger.IsEnabled() {
+	if w.isStreaming && w.logger != nil && w.logger.IsEnabled() {
 		streamWriter, err := w.logger.LogStreamingRequest(
 			w.requestInfo.URL,
 			w.requestInfo.Method,
@@ -255,7 +284,7 @@ func (w *ResponseWriterWrapper) processStreamingChunks(done chan struct{}) {
 // For non-streaming responses, it logs the complete request and response details,
 // including any API-specific request/response data stored in the Gin context.
 func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
-	if w.logger == nil {
+	if w.logger == nil && w.tracingState == nil {
 		return nil
 	}
 
@@ -277,8 +306,25 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 	}
 
 	hasAPIError := len(slicesAPIResponseError) > 0 || finalStatusCode >= http.StatusBadRequest
-	forceLog := w.logOnErrorOnly && hasAPIError && !w.logger.IsEnabled()
-	if !w.logger.IsEnabled() && !forceLog {
+	loggerEnabled := w.logger != nil && w.logger.IsEnabled()
+	forceLog := w.logOnErrorOnly && hasAPIError && !loggerEnabled
+	requestStatus := tracing.RequestStatusSucceeded
+	if hasAPIError {
+		requestStatus = tracing.RequestStatusFailed
+	} else if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+		requestStatus = tracing.RequestStatusInterrupted
+	}
+	if w.tracingState != nil {
+		tracing.FinalizeRequest(c.Request.Context(), tracing.RequestFinish{
+			RequestID:       w.tracingState.RequestID(),
+			StatusCode:      finalStatusCode,
+			Status:          requestStatus,
+			FinishedAt:      time.Now().UTC(),
+			FirstByteAt:     w.tracingState.ResponseFirstByteAt(),
+			ResponseHeaders: http.Header(w.cloneHeaders()),
+		})
+	}
+	if w.logger == nil || (!loggerEnabled && !forceLog) {
 		return nil
 	}
 

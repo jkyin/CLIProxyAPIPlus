@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/tracing"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
@@ -488,6 +489,23 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 	go func() {
 		defer close(out)
 		var failed bool
+		finishAttempt := func(outcome string, chunkErr error) {
+			errorCode := ""
+			errorMessage := ""
+			statusCode := 0
+			if chunkErr != nil {
+				errorCode = "stream_error"
+				errorMessage = chunkErr.Error()
+				statusCode = statusCodeFromError(chunkErr)
+			}
+			tracing.FinishAttempt(ctx, tracing.AttemptFinish{
+				Outcome:      outcome,
+				FinishedAt:   time.Now().UTC(),
+				StatusCode:   statusCode,
+				ErrorCode:    errorCode,
+				ErrorMessage: errorMessage,
+			})
+		}
 		forward := true
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
@@ -497,6 +515,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 					rerr.HTTPStatus = se.StatusCode()
 				}
 				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr})
+				finishAttempt(tracing.AttemptOutcomeFailed, chunk.Err)
 			}
 			if !forward {
 				return false
@@ -508,6 +527,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 			select {
 			case <-ctx.Done():
 				forward = false
+				finishAttempt(tracing.AttemptOutcomeInterrupted, ctx.Err())
 				return false
 			case out <- chunk:
 				return true
@@ -527,6 +547,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 		}
 		if !failed {
 			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: true})
+			finishAttempt(tracing.AttemptOutcomeSucceeded, nil)
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -539,10 +560,25 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	execModels := m.prepareExecutionModels(auth, routeModel)
 	var lastErr error
 	for idx, execModel := range execModels {
+		retryScope := "initial"
+		if idx > 0 {
+			retryScope = "model_pool_retry"
+		}
+		attemptCtx, _, errTrace := tracing.StartAttempt(ctx, tracingAttemptStart(auth, provider, executor.Identifier(), retryScope, routeModel, execModel))
+		if errTrace != nil {
+			attemptCtx = ctx
+		}
 		execReq := req
 		execReq.Model = execModel
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
+		streamResult, errStream := executor.ExecuteStream(attemptCtx, auth, execReq, opts)
 		if errStream != nil {
+			tracing.FinishAttempt(attemptCtx, tracing.AttemptFinish{
+				Outcome:      tracing.AttemptOutcomeFailed,
+				FinishedAt:   time.Now().UTC(),
+				StatusCode:   statusCodeFromError(errStream),
+				ErrorCode:    "stream_error",
+				ErrorMessage: errStream.Error(),
+			})
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
@@ -573,7 +609,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				m.MarkResult(attemptCtx, result)
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
 			}
@@ -584,7 +620,14 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				m.MarkResult(attemptCtx, result)
+				tracing.FinishAttempt(attemptCtx, tracing.AttemptFinish{
+					Outcome:      tracing.AttemptOutcomeFailed,
+					FinishedAt:   time.Now().UTC(),
+					StatusCode:   statusCodeFromError(bootstrapErr),
+					ErrorCode:    "bootstrap_error",
+					ErrorMessage: bootstrapErr.Error(),
+				})
 				discardStreamChunks(streamResult.Chunks)
 				lastErr = bootstrapErr
 				continue
@@ -592,13 +635,20 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			errCh := make(chan cliproxyexecutor.StreamChunk, 1)
 			errCh <- cliproxyexecutor.StreamChunk{Err: bootstrapErr}
 			close(errCh)
-			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
+			return m.wrapStreamResult(attemptCtx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
 		}
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: emptyErr}
-			m.MarkResult(ctx, result)
+			m.MarkResult(attemptCtx, result)
+			tracing.FinishAttempt(attemptCtx, tracing.AttemptFinish{
+				Outcome:      tracing.AttemptOutcomeFailed,
+				FinishedAt:   time.Now().UTC(),
+				StatusCode:   0,
+				ErrorCode:    emptyErr.Code,
+				ErrorMessage: emptyErr.Message,
+			})
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
 				continue
@@ -606,7 +656,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			errCh := make(chan cliproxyexecutor.StreamChunk, 1)
 			errCh <- cliproxyexecutor.StreamChunk{Err: emptyErr}
 			close(errCh)
-			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
+			return m.wrapStreamResult(attemptCtx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
 		}
 
 		remaining := streamResult.Chunks
@@ -615,7 +665,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResult(attemptCtx, auth.Clone(), provider, routeModel, streamResult.Headers, buffered, remaining), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -900,6 +950,13 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		if !shouldRetry {
 			break
 		}
+		_ = tracing.DefaultRecorder().RecordRequestEvent(ctx, tracingRequestID(ctx), "", "request.auth_retry_scheduled", time.Now().UTC(), map[string]any{
+			"retry_scope":     "auth_retry",
+			"attempt_index":   attempt + 1,
+			"wait_ms":         wait.Milliseconds(),
+			"requested_model": req.Model,
+			"error":           errExec.Error(),
+		})
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
@@ -931,6 +988,13 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 		if !shouldRetry {
 			break
 		}
+		_ = tracing.DefaultRecorder().RecordRequestEvent(ctx, tracingRequestID(ctx), "", "request.auth_retry_scheduled", time.Now().UTC(), map[string]any{
+			"retry_scope":     "auth_retry",
+			"attempt_index":   attempt + 1,
+			"wait_ms":         wait.Milliseconds(),
+			"requested_model": req.Model,
+			"error":           errExec.Error(),
+		})
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
 			return cliproxyexecutor.Response{}, errWait
 		}
@@ -962,6 +1026,13 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if !shouldRetry {
 			break
 		}
+		_ = tracing.DefaultRecorder().RecordRequestEvent(ctx, tracingRequestID(ctx), "", "request.auth_retry_scheduled", time.Now().UTC(), map[string]any{
+			"retry_scope":     "auth_retry",
+			"attempt_index":   attempt + 1,
+			"wait_ms":         wait.Milliseconds(),
+			"requested_model": req.Model,
+			"error":           errStream.Error(),
+		})
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
 			return nil, errWait
 		}
@@ -1008,12 +1079,27 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models := m.prepareExecutionModels(auth, routeModel)
 		var authErr error
-		for _, upstreamModel := range models {
+		for modelIdx, upstreamModel := range models {
 			execReq := req
 			execReq.Model = upstreamModel
-			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+			retryScope := "initial"
+			if modelIdx > 0 {
+				retryScope = "model_pool_retry"
+			}
+			attemptCtx, _, errTrace := tracing.StartAttempt(execCtx, tracingAttemptStart(auth, provider, executor.Identifier(), retryScope, routeModel, upstreamModel))
+			if errTrace != nil {
+				attemptCtx = execCtx
+			}
+			resp, errExec := executor.Execute(attemptCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 			if errExec != nil {
+				tracing.FinishAttempt(attemptCtx, tracing.AttemptFinish{
+					Outcome:      tracing.AttemptOutcomeFailed,
+					FinishedAt:   time.Now().UTC(),
+					StatusCode:   statusCodeFromError(errExec),
+					ErrorCode:    "execute_error",
+					ErrorMessage: errExec.Error(),
+				})
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
@@ -1031,6 +1117,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				authErr = errExec
 				continue
 			}
+			tracing.FinishAttempt(attemptCtx, tracing.AttemptFinish{
+				Outcome:    tracing.AttemptOutcomeSucceeded,
+				FinishedAt: time.Now().UTC(),
+			})
 			m.MarkResult(execCtx, result)
 			return resp, nil
 		}
@@ -1080,12 +1170,27 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		models := m.prepareExecutionModels(auth, routeModel)
 		var authErr error
-		for _, upstreamModel := range models {
+		for modelIdx, upstreamModel := range models {
 			execReq := req
 			execReq.Model = upstreamModel
-			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
+			retryScope := "initial"
+			if modelIdx > 0 {
+				retryScope = "model_pool_retry"
+			}
+			attemptCtx, _, errTrace := tracing.StartAttempt(execCtx, tracingAttemptStart(auth, provider, executor.Identifier(), retryScope, routeModel, upstreamModel))
+			if errTrace != nil {
+				attemptCtx = execCtx
+			}
+			resp, errExec := executor.CountTokens(attemptCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 			if errExec != nil {
+				tracing.FinishAttempt(attemptCtx, tracing.AttemptFinish{
+					Outcome:      tracing.AttemptOutcomeFailed,
+					FinishedAt:   time.Now().UTC(),
+					StatusCode:   statusCodeFromError(errExec),
+					ErrorCode:    "count_error",
+					ErrorMessage: errExec.Error(),
+				})
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
 				}
@@ -1103,6 +1208,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				authErr = errExec
 				continue
 			}
+			tracing.FinishAttempt(attemptCtx, tracing.AttemptFinish{
+				Outcome:    tracing.AttemptOutcomeSucceeded,
+				FinishedAt: time.Now().UTC(),
+			})
 			m.hook.OnResult(execCtx, result)
 			return resp, nil
 		}
@@ -1233,6 +1342,63 @@ func publishSelectedAuthMetadata(meta map[string]any, authID string) {
 	if callback, ok := meta[cliproxyexecutor.SelectedAuthCallbackMetadataKey].(func(string)); ok && callback != nil {
 		callback(authID)
 	}
+}
+
+func tracingSourcePath(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.FileName)
+}
+
+func tracingSourceKind(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil && strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true") {
+		return "memory"
+	}
+	if strings.TrimSpace(auth.FileName) != "" {
+		return "file"
+	}
+	return "memory"
+}
+
+func tracingAttemptStart(auth *Auth, provider, executorID, retryScope, routeModel, upstreamModel string) tracing.AttemptStart {
+	accountType, account := "", ""
+	if auth != nil {
+		accountType, account = auth.AccountInfo()
+	}
+	authStatus := ""
+	if auth != nil {
+		authStatus = string(auth.Status)
+	}
+	return tracing.AttemptStart{
+		AttemptID:        tracing.MustNewID(),
+		RetryScope:       retryScope,
+		Provider:         provider,
+		ExecutorID:       executorID,
+		AuthID:           strings.TrimSpace(valueOrEmpty(auth, func(a *Auth) string { return a.ID })),
+		AuthIndex:        strings.TrimSpace(valueOrEmpty(auth, func(a *Auth) string { return a.EnsureIndex() })),
+		AuthSnapshotJSON: tracing.AuthSnapshotJSON(provider, valueOrEmpty(auth, func(a *Auth) string { return a.ID }), valueOrEmpty(auth, func(a *Auth) string { return a.EnsureIndex() }), valueOrEmpty(auth, func(a *Auth) string { return a.Label }), accountType, account, tracingSourcePath(auth), tracingSourceKind(auth), authStatus, auth != nil && auth.Unavailable, valueOrZeroTime(auth, func(a *Auth) time.Time { return a.NextRetryAfter })),
+		RouteModel:       routeModel,
+		UpstreamModel:    upstreamModel,
+		StartedAt:        time.Now().UTC(),
+	}
+}
+
+func valueOrEmpty[T any](value *T, getter func(*T) string) string {
+	if value == nil {
+		return ""
+	}
+	return getter(value)
+}
+
+func valueOrZeroTime[T any](value *T, getter func(*T) time.Time) time.Time {
+	if value == nil {
+		return time.Time{}
+	}
+	return getter(value)
 }
 
 func rewriteModelForAuth(model string, auth *Auth) string {
@@ -2727,6 +2893,13 @@ func logEntryWithRequestID(ctx context.Context) *log.Entry {
 		return log.WithField("request_id", reqID)
 	}
 	return log.NewEntry(log.StandardLogger())
+}
+
+func tracingRequestID(ctx context.Context) string {
+	if state := tracing.RequestStateFromContext(ctx); state != nil {
+		return state.RequestID()
+	}
+	return ""
 }
 
 func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model string) {

@@ -8,14 +8,18 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	apimiddleware "github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
+	itracing "github.com/router-for-me/CLIProxyAPI/v6/internal/tracing"
+	sqlitetracing "github.com/router-for-me/CLIProxyAPI/v6/internal/tracing/sqlite"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
@@ -90,6 +94,9 @@ type Service struct {
 
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
+
+	// traceRecorder persists high-fidelity request tracing when enabled.
+	traceRecorder itracing.Recorder
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -360,6 +367,24 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval, cfg.MaxRetryCredentials)
 }
 
+func resolveTracingDir(configPath string, cfg *config.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	dir := strings.TrimSpace(cfg.Tracing.Dir)
+	if dir == "" {
+		dir = "./tracing"
+	}
+	if filepath.IsAbs(dir) {
+		return dir
+	}
+	base := "."
+	if strings.TrimSpace(configPath) != "" {
+		base = filepath.Dir(configPath)
+	}
+	return filepath.Clean(filepath.Join(base, dir))
+}
+
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
 	if a == nil {
 		return "", "", false
@@ -532,7 +557,25 @@ func (s *Service) Run(ctx context.Context) error {
 	// legacy clients removed; no caches to refresh
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
-	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+	serverOptions := append([]api.ServerOption(nil), s.serverOptions...)
+	if s.cfg != nil && s.cfg.Tracing.Enabled {
+		traceDir := resolveTracingDir(s.configPath, s.cfg)
+		recorder, errTracing := sqlitetracing.New(ctx, sqlitetracing.Config{
+			BaseDir:   traceDir,
+			EmitSSE:   s.cfg.Tracing.EmitSSE,
+			PruneDays: s.cfg.Tracing.PruneDays,
+		})
+		if errTracing != nil {
+			return fmt.Errorf("cliproxy: failed to initialize tracing store: %w", errTracing)
+		}
+		s.traceRecorder = recorder
+		itracing.SetDefaultRecorder(recorder)
+		serverOptions = append(serverOptions, api.WithMiddleware(apimiddleware.TracingMiddleware(s.cfg, recorder)))
+	} else {
+		itracing.SetDefaultRecorder(nil)
+		s.traceRecorder = nil
+	}
+	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOptions...)
 
 	if s.authManager == nil {
 		s.authManager = newDefaultAuthManager()
@@ -584,9 +627,11 @@ func (s *Service) Run(ctx context.Context) error {
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
 		previousStrategy := ""
+		var previousTracing config.TracingConfig
 		s.cfgMu.RLock()
 		if s.cfg != nil {
 			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+			previousTracing = s.cfg.Tracing
 		}
 		s.cfgMu.RUnlock()
 
@@ -622,6 +667,9 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 
 		s.applyRetryConfig(newCfg)
+		if previousTracing != newCfg.Tracing {
+			log.Warn("tracing config changed; restart is required for tracing store changes to take effect")
+		}
 		s.applyPprofConfig(newCfg)
 		if s.server != nil {
 			s.server.UpdateClients(newCfg)
@@ -746,6 +794,14 @@ func (s *Service) Shutdown(ctx context.Context) error {
 					shutdownErr = err
 				}
 			}
+		}
+
+		if s.traceRecorder != nil {
+			if err := s.traceRecorder.Close(); err != nil && shutdownErr == nil {
+				shutdownErr = err
+			}
+			s.traceRecorder = nil
+			itracing.SetDefaultRecorder(nil)
 		}
 
 		usage.StopDefault()

@@ -8,6 +8,11 @@ All third-party provider support is maintained by community contributors; CLIPro
 
 The Plus release stays in lockstep with the mainline features.
 
+## Tracing Docs
+
+- Request tracing integration: [docs/tracing-integration.md](docs/tracing-integration.md)
+- Request tracing API examples: [docs/tracing-api-examples.md](docs/tracing-api-examples.md)
+
 ## Contributing
 
 This project only accepts pull requests that relate to third-party provider support. Any pull requests unrelated to third-party provider support will be rejected.
