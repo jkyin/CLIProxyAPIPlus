@@ -247,6 +247,74 @@ type StatusRecord struct {
 	BodiesDir       string `json:"bodies_dir,omitempty"`
 }
 
+type RequestSummaryFilter struct {
+	Limit          int
+	Offset         int
+	Search         string
+	Status         string
+	Provider       string
+	RequestedModel string
+	HasUsageOnly   bool
+	StreamOnly     *bool
+}
+
+type RequestSummaryRecord struct {
+	RequestID         string `json:"request_id"`
+	StartedAtNS       int64  `json:"started_at_ns"`
+	Provider          string `json:"provider,omitempty"`
+	RequestedModel    string `json:"requested_model,omitempty"`
+	RouteModel        string `json:"route_model,omitempty"`
+	UpstreamModel     string `json:"upstream_model,omitempty"`
+	AuthLabel         string `json:"auth_label,omitempty"`
+	AuthAccount       string `json:"auth_account,omitempty"`
+	AuthPath          string `json:"auth_path,omitempty"`
+	AuthIndex         string `json:"auth_index,omitempty"`
+	HTTPMethod        string `json:"http_method"`
+	HTTPPath          string `json:"http_path"`
+	HTTPQuery         string `json:"http_query,omitempty"`
+	StatusCode        *int   `json:"status_code,omitempty"`
+	DurationMS        *int64 `json:"duration_ms,omitempty"`
+	InputTokens       *int64 `json:"input_tokens,omitempty"`
+	OutputTokens      *int64 `json:"output_tokens,omitempty"`
+	TotalTokens       *int64 `json:"total_tokens,omitempty"`
+	ReasoningTokens   *int64 `json:"reasoning_tokens,omitempty"`
+	CachedTokens      *int64 `json:"cached_tokens,omitempty"`
+	RequestStatus     string `json:"request_status"`
+	UsageCompleteness string `json:"usage_completeness,omitempty"`
+	IsStream          bool   `json:"is_stream"`
+	UpdatedAtNS       int64  `json:"updated_at_ns"`
+}
+
+type RequestSummaryPage struct {
+	Items      []RequestSummaryRecord `json:"items"`
+	TotalCount int                    `json:"total_count"`
+	NextOffset *int                   `json:"next_offset,omitempty"`
+}
+
+type RequestDetailRecord struct {
+	Request              *RequestRecord        `json:"request,omitempty"`
+	Attempts             []AttemptRecord       `json:"attempts"`
+	UsageFinal           *UsageFinalRecord     `json:"usage_final,omitempty"`
+	RequestBlob          *BlobRecord           `json:"request_blob,omitempty"`
+	ResponseBlob         *BlobRecord           `json:"response_blob,omitempty"`
+	AttemptRequestBlobs  map[string]BlobRecord `json:"attempt_request_blobs,omitempty"`
+	AttemptResponseBlobs map[string]BlobRecord `json:"attempt_response_blobs,omitempty"`
+}
+
+const (
+	RequestSummaryEventReady  = "ready"
+	RequestSummaryEventUpsert = "upsert"
+	RequestSummaryEventDelete = "delete"
+)
+
+type RequestSummaryEvent struct {
+	Type      string                `json:"type"`
+	RequestID string                `json:"request_id,omitempty"`
+	Summary   *RequestSummaryRecord `json:"summary,omitempty"`
+	LatestSeq int64                 `json:"latest_seq"`
+	TS        string                `json:"ts"`
+}
+
 type Recorder interface {
 	Enabled() bool
 	BootID() string
@@ -266,9 +334,13 @@ type Recorder interface {
 	Subscribe() (<-chan int64, func())
 	Status(ctx context.Context) (StatusRecord, error)
 	ListEvents(ctx context.Context, afterSeq int64, limit int) ([]EventRecord, error)
+	ListRequestSummaries(ctx context.Context, filter RequestSummaryFilter) (RequestSummaryPage, error)
 	GetRequest(ctx context.Context, requestID string) (*RequestRecord, error)
+	GetRequestDetail(ctx context.Context, requestID string) (*RequestDetailRecord, error)
 	ListAttempts(ctx context.Context, requestID string) ([]AttemptRecord, error)
 	GetUsage(ctx context.Context, requestID string) (*UsageFinalRecord, error)
 	GetBlob(ctx context.Context, blobID string) (*BlobRecord, error)
+	DeleteRequest(ctx context.Context, requestID string) (bool, error)
+	SubscribeRequestSummaries() (<-chan RequestSummaryEvent, func())
 	Close() error
 }

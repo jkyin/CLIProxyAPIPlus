@@ -37,13 +37,25 @@ func (disabledRecorder) Status(context.Context) (StatusRecord, error) { return S
 func (disabledRecorder) ListEvents(context.Context, int64, int) ([]EventRecord, error) {
 	return nil, nil
 }
+func (disabledRecorder) ListRequestSummaries(context.Context, RequestSummaryFilter) (RequestSummaryPage, error) {
+	return RequestSummaryPage{}, nil
+}
 func (disabledRecorder) GetRequest(context.Context, string) (*RequestRecord, error) { return nil, nil }
+func (disabledRecorder) GetRequestDetail(context.Context, string) (*RequestDetailRecord, error) {
+	return nil, nil
+}
 func (disabledRecorder) ListAttempts(context.Context, string) ([]AttemptRecord, error) {
 	return nil, nil
 }
 func (disabledRecorder) GetUsage(context.Context, string) (*UsageFinalRecord, error) { return nil, nil }
 func (disabledRecorder) GetBlob(context.Context, string) (*BlobRecord, error)        { return nil, nil }
-func (disabledRecorder) Close() error                                                { return nil }
+func (disabledRecorder) DeleteRequest(context.Context, string) (bool, error)         { return false, nil }
+func (disabledRecorder) SubscribeRequestSummaries() (<-chan RequestSummaryEvent, func()) {
+	ch := make(chan RequestSummaryEvent)
+	close(ch)
+	return ch, func() {}
+}
+func (disabledRecorder) Close() error { return nil }
 
 func SetDefaultRecorder(recorder Recorder) {
 	if recorder == nil {

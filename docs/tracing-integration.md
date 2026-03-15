@@ -4,16 +4,19 @@ This document is intended to be handed to another project so it can integrate wi
 
 ## What is authoritative
 
-CLIProxyAPI now persists tracing data to:
+CLIProxyAPI persists tracing data to:
 
-- `tracing.db`: the authoritative structured event store
-- `tracing/bodies/`: large and streaming body payloads
+- `tracing.db`: the authoritative structured tracing store
+- `tracing/bodies/`: large and streaming body payloads referenced by blob ID
 
 These are not authoritative:
 
-- `/usage`: summary / aggregate usage only
+- `/usage`: aggregate usage only
 - `/auth-files`: current auth inventory only
-- `/tracing/sse`: real-time notification only
+- `/tracing/sse`: sequence notification transport only
+- `/tracing/requests/stream`: live request-summary projection transport only
+
+The authoritative facts still come from the persisted tracing tables and blobs.
 
 ## Configuration
 
@@ -32,44 +35,108 @@ tracing:
 Notes:
 
 - `tracing.dir` is the base directory for `tracing.db` and `tracing/bodies/`
+- `body-inline-max-bytes` controls when a blob stays inline in SQLite vs spills to file
 - `max-body-bytes: 0` means no truncation
 - changes to tracing config currently require a CLIProxyAPI restart
 
 ## APIs
 
-Authoritative incremental API:
+### Live query APIs
+
+These are the preferred APIs for request-list UIs and live inspection tools:
+
+- `GET /v0/management/tracing/requests?limit=<n>&offset=<n>&search=<q>&status=<all|success|failure>&provider=<name>&requested_model=<name>&has_usage_only=<bool>&stream_only=<bool>`
+- `GET /v0/management/tracing/requests/:request_id/detail`
+- `DELETE /v0/management/tracing/requests/:request_id`
+- `GET /v0/management/tracing/requests/stream`
+
+`/tracing/requests` returns a projected summary page optimized for list queries.
+
+`/tracing/requests/:request_id/detail` returns a single aggregated payload that includes:
+
+- `request`
+- `attempts`
+- `usage_final`
+- request / response blob metadata
+- attempt request / response blob metadata
+
+`/tracing/requests/stream` emits:
+
+- `ready`
+- `upsert`
+- `delete`
+
+Each `upsert` carries the latest full summary snapshot for one `request_id`.
+
+### Durable incremental APIs
+
+These remain available for consumers that maintain their own local projection and checkpoint:
 
 - `GET /v0/management/tracing/events?after_seq=<n>&limit=<m>`
+- `GET /v0/management/tracing/sse`
 
-Request detail APIs:
+`/tracing/sse` is only a notification stream for new `latest_seq` values. It is not a replay source.
+
+### Record detail APIs
+
+These remain available for compatibility and low-level hydration:
 
 - `GET /v0/management/tracing/requests/:request_id`
 - `GET /v0/management/tracing/requests/:request_id/attempts`
 - `GET /v0/management/tracing/requests/:request_id/usage`
 
-Body APIs:
+### Body APIs
 
 - `GET /v0/management/tracing/blobs/:blob_id`
 - `GET /v0/management/tracing/blobs/:blob_id?raw=1`
 
-Real-time notification API:
-
-- `GET /v0/management/tracing/sse`
-
-Status API:
+### Status API
 
 - `GET /v0/management/tracing/status`
 
-## Recommended consumer flow
+## Recommended consumer flows
+
+### Flow A: live UI consumer
+
+Use this for request lists, detail pages, and live operator tools.
+
+1. Load the initial request list from `/tracing/requests`
+2. Open request detail on demand via `/tracing/requests/:request_id/detail`
+3. Fetch blob payloads only when the UI actually needs them
+4. Connect `/tracing/requests/stream`
+5. Apply `upsert` and `delete` events by `request_id`
+6. Treat each `upsert` as full replacement of the previous summary row for that request
+
+Important notes:
+
+- `ready` only means the stream is live; it is not a historical replay
+- the same request can emit multiple `upsert` events while it is still running
+- if the stream disconnects and you only need current live state, reload `/tracing/requests`
+- if you need exact catch-up semantics, use Flow B instead
+
+### Flow B: durable local mirror consumer
+
+Use this only if your project needs its own persistent local projection with crash recovery.
 
 1. Persist a local `last_seq`
 2. On startup, call `/tracing/events?after_seq=<last_seq>`
 3. Apply events in ascending `seq`
 4. Advance `last_seq` only after the local transaction commits
-5. After catch-up, connect `/tracing/sse`
-6. When SSE signals a new `latest_seq`, go back to `/tracing/events`
+5. Connect `/tracing/sse`
+6. When `/tracing/sse` signals a newer `latest_seq`, return to `/tracing/events`
 
 Do not treat SSE as the only source of truth.
+
+## Summary stream semantics
+
+The request-summary stream is derived from the authoritative tracing tables. It is a projection, not a separate fact store.
+
+Important behaviors:
+
+- multiple `upsert` events for the same request are expected
+- updates can occur on request start, route changes, attempt lifecycle changes, response metadata changes, request finalization, and usage finalization
+- `latest_seq` may repeat across multiple summary `upsert` events because it tracks the latest committed row in `trace_event`, not the number of summary publishes
+- consumers should always key summary rows by `request_id`
 
 ## Semantics
 
@@ -149,8 +216,8 @@ Completeness values:
 Rules:
 
 - `missing` is not the same as zero tokens
-- When `completeness=missing`, token columns in `trace_usage_final` are stored as `NULL`
-- The management usage API and `usage.finalized` event payload also emit `null` token fields for `missing`
+- when `completeness=missing`, token columns in `trace_usage_final` are stored as `NULL`
+- the management usage API and `usage.finalized` payload also emit `null` token fields for `missing`
 - `derived_total=true` means `total_tokens` was computed locally
 
 ### Auth snapshot
@@ -179,26 +246,25 @@ Integrate with CLIProxyAPI request tracing.
 Use CLIProxyAPI as the authoritative source of request / attempt / usage facts.
 Do not use /usage, /auth-files, external HTTP capture, or heuristic matching as the main path.
 
+Choose one integration mode:
+
+1. Live UI mode
+   - Use GET /v0/management/tracing/requests for list queries
+   - Use GET /v0/management/tracing/requests/:request_id/detail for detail pages
+   - Use GET /v0/management/tracing/requests/stream for ready/upsert/delete live updates
+   - Treat each upsert as full replacement keyed by request_id
+
+2. Durable mirror mode
+   - Use GET /v0/management/tracing/events?after_seq=<n>&limit=<m> as the only incremental replay source
+   - Use GET /v0/management/tracing/sse as notification only
+   - Persist last_seq and advance it only after local commit
+
 Requirements:
-1. Use GET /v0/management/tracing/events?after_seq=<n>&limit=<m> as the only incremental source
-2. Use request_id as the request primary key and attempt_id as the upstream-attempt primary key
-3. Use the request / attempts / usage / blob endpoints to hydrate details
-4. Treat GET /v0/management/tracing/sse as a notification layer only
-5. Treat trace_usage_final as the final token usage result
-6. Respect completeness=complete|partial|missing
-7. Never convert missing usage into zero tokens
-8. Treat /usage as summary only
-9. Treat /auth-files as current-state inventory only
-
-Design and implement:
-- a tracing ingest module
-- persistent last_seq checkpoint storage
-- local request / attempt / usage / blob models
-- startup catch-up + steady-state SSE notification flow
-- idempotent event application and crash recovery
-
-Constraints:
-- last_seq advances only after local commit
-- blob fetch failures must not block the main event pipeline
-- request / attempt / usage must be queryable independently
+- Use request_id as the request primary key and attempt_id as the upstream-attempt primary key
+- Treat trace_usage_final as the final token usage result
+- Respect completeness=complete|partial|missing
+- Never convert missing usage into zero tokens
+- Treat /usage as summary only
+- Treat /auth-files as current-state inventory only
+- Blob fetch failures must not block the main event pipeline
 ```

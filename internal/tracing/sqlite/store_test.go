@@ -215,6 +215,189 @@ func TestStoreUsageMissingTokensAreNull(t *testing.T) {
 	}
 }
 
+func TestStoreRequestSummariesDetailAndDelete(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := New(ctx, Config{BaseDir: dir, EmitSSE: true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	requestID := tracing.MustNewID()
+	attemptID := tracing.MustNewID()
+	startedAt := time.Now().UTC()
+	requestBlob := &tracing.BlobRecord{
+		BlobID:      tracing.MustNewID(),
+		StorageKind: "inline",
+		SizeBytes:   7,
+		Complete:    true,
+		InlineBytes: []byte(`{"a":1}`),
+	}
+	responseBlob := &tracing.BlobRecord{
+		BlobID:      tracing.MustNewID(),
+		StorageKind: "inline",
+		SizeBytes:   4,
+		Complete:    true,
+		InlineBytes: []byte("pong"),
+	}
+	if err := store.SaveBlob(ctx, requestBlob); err != nil {
+		t.Fatalf("SaveBlob(request) error = %v", err)
+	}
+	if err := store.SaveBlob(ctx, responseBlob); err != nil {
+		t.Fatalf("SaveBlob(response) error = %v", err)
+	}
+
+	if err := store.StartRequest(ctx, tracing.RequestStart{
+		RequestID:         requestID,
+		StartedAt:         startedAt,
+		Method:            http.MethodPost,
+		Scheme:            "http",
+		Host:              "localhost:8317",
+		Path:              "/v1/responses",
+		Query:             "debug=1",
+		RequestHeaders:    http.Header{"Content-Type": {"application/json"}},
+		RequestBodyBlobID: requestBlob.BlobID,
+		IsStream:          true,
+		HandlerType:       "openai",
+		RequestedModel:    "gpt-5",
+	}); err != nil {
+		t.Fatalf("StartRequest() error = %v", err)
+	}
+
+	if err := store.BeginAttempt(ctx, tracing.AttemptStart{
+		RequestID:        requestID,
+		AttemptID:        attemptID,
+		AttemptNo:        1,
+		RetryScope:       "initial",
+		Provider:         "openai",
+		AuthIndex:        "idx-7",
+		AuthSnapshotJSON: tracing.AuthSnapshotJSON("openai", "auth-1", "idx-7", "Work", "oauth", "jkyin@example.com", "/tmp/auth.json", "file", "ready", false, time.Time{}),
+		RouteModel:       "gpt-5",
+		UpstreamModel:    "gpt-5.4",
+		StartedAt:        startedAt,
+	}); err != nil {
+		t.Fatalf("BeginAttempt() error = %v", err)
+	}
+
+	if err := store.UpdateAttemptRequest(ctx, tracing.AttemptRequest{
+		AttemptID:         attemptID,
+		UpstreamURL:       "https://api.openai.com/v1/responses",
+		UpstreamMethod:    http.MethodPost,
+		UpstreamProtocol:  "https",
+		RequestHeaders:    http.Header{"Authorization": {"Bearer masked"}},
+		RequestBodyBlobID: requestBlob.BlobID,
+	}); err != nil {
+		t.Fatalf("UpdateAttemptRequest() error = %v", err)
+	}
+
+	if err := store.UpdateAttemptResponse(ctx, tracing.AttemptResponse{
+		AttemptID:          attemptID,
+		StatusCode:         200,
+		HeadersAt:          startedAt.Add(10 * time.Millisecond),
+		FirstByteAt:        startedAt.Add(20 * time.Millisecond),
+		ResponseHeaders:    http.Header{"Content-Type": {"application/json"}},
+		ResponseBodyBlobID: responseBlob.BlobID,
+	}); err != nil {
+		t.Fatalf("UpdateAttemptResponse() error = %v", err)
+	}
+
+	if err := store.FinishAttempt(ctx, tracing.AttemptFinish{
+		AttemptID:  attemptID,
+		Outcome:    tracing.AttemptOutcomeSucceeded,
+		StatusCode: 200,
+		FinishedAt: startedAt.Add(40 * time.Millisecond),
+	}); err != nil {
+		t.Fatalf("FinishAttempt() error = %v", err)
+	}
+
+	if err := store.FinalizeUsage(ctx, tracing.UsageFinal{
+		RequestID:       requestID,
+		AttemptID:       attemptID,
+		FinalizedAt:     startedAt.Add(50 * time.Millisecond),
+		Status:          "success",
+		Completeness:    tracing.UsageCompletenessComplete,
+		InputTokens:     11,
+		OutputTokens:    29,
+		ReasoningTokens: 3,
+		CachedTokens:    1,
+		TotalTokens:     40,
+	}); err != nil {
+		t.Fatalf("FinalizeUsage() error = %v", err)
+	}
+
+	if err := store.FinalizeRequest(ctx, tracing.RequestFinish{
+		RequestID:          requestID,
+		StatusCode:         200,
+		Status:             tracing.RequestStatusSucceeded,
+		FinishedAt:         startedAt.Add(60 * time.Millisecond),
+		FirstByteAt:        startedAt.Add(25 * time.Millisecond),
+		ResponseHeaders:    http.Header{"Content-Type": {"application/json"}},
+		ResponseBodyBlobID: responseBlob.BlobID,
+	}); err != nil {
+		t.Fatalf("FinalizeRequest() error = %v", err)
+	}
+
+	page, err := store.ListRequestSummaries(ctx, tracing.RequestSummaryFilter{
+		Limit:          10,
+		Provider:       "openai",
+		RequestedModel: "gpt-5",
+		HasUsageOnly:   true,
+	})
+	if err != nil {
+		t.Fatalf("ListRequestSummaries() error = %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("ListRequestSummaries() len = %d, want 1", len(page.Items))
+	}
+	summary := page.Items[0]
+	if summary.RequestID != requestID || summary.Provider != "openai" || summary.AuthLabel != "Work" || summary.AuthAccount != "jkyin@example.com" || summary.AuthPath != "/tmp/auth.json" {
+		t.Fatalf("summary = %#v, want populated provider/auth fields", summary)
+	}
+	if summary.StatusCode == nil || *summary.StatusCode != 200 {
+		t.Fatalf("summary.StatusCode = %#v, want 200", summary.StatusCode)
+	}
+	if summary.TotalTokens == nil || *summary.TotalTokens != 40 {
+		t.Fatalf("summary.TotalTokens = %#v, want 40", summary.TotalTokens)
+	}
+
+	detail, err := store.GetRequestDetail(ctx, requestID)
+	if err != nil {
+		t.Fatalf("GetRequestDetail() error = %v", err)
+	}
+	if detail == nil || detail.Request == nil || len(detail.Attempts) != 1 || detail.UsageFinal == nil {
+		t.Fatalf("GetRequestDetail() = %#v, want populated detail", detail)
+	}
+	if detail.RequestBlob == nil || detail.RequestBlob.BlobID != requestBlob.BlobID || len(detail.RequestBlob.InlineBytes) != 0 {
+		t.Fatalf("detail.RequestBlob = %#v, want metadata-only request blob", detail.RequestBlob)
+	}
+	if detail.AttemptResponseBlobs[attemptID].BlobID != responseBlob.BlobID {
+		t.Fatalf("detail.AttemptResponseBlobs = %#v, want attempt response blob", detail.AttemptResponseBlobs)
+	}
+
+	deleted, err := store.DeleteRequest(ctx, requestID)
+	if err != nil {
+		t.Fatalf("DeleteRequest() error = %v", err)
+	}
+	if !deleted {
+		t.Fatal("DeleteRequest() = false, want true")
+	}
+	deletedSummaryPage, err := store.ListRequestSummaries(ctx, tracing.RequestSummaryFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListRequestSummaries(after delete) error = %v", err)
+	}
+	if len(deletedSummaryPage.Items) != 0 {
+		t.Fatalf("ListRequestSummaries(after delete) = %#v, want empty", deletedSummaryPage.Items)
+	}
+	blobRecord, err := store.GetBlob(ctx, responseBlob.BlobID)
+	if err != nil {
+		t.Fatalf("GetBlob(after delete) error = %v", err)
+	}
+	if blobRecord != nil {
+		t.Fatalf("GetBlob(after delete) = %#v, want nil for orphan blob", blobRecord)
+	}
+}
+
 func TestStoreMigratesMissingUsageZerosToNull(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -295,7 +478,7 @@ func TestStoreMigratesMissingUsageZerosToNull(t *testing.T) {
 	`).Scan(&schemaVersion); err != nil {
 		t.Fatalf("schema version query error = %v", err)
 	}
-	if schemaVersion != "2" {
-		t.Fatalf("schema_version = %q, want 2", schemaVersion)
+	if schemaVersion != "3" {
+		t.Fatalf("schema_version = %q, want 3", schemaVersion)
 	}
 }
