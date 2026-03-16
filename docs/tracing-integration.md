@@ -13,8 +13,7 @@ These are not authoritative:
 
 - `/usage`: aggregate usage only
 - `/auth-files`: current auth inventory only
-- `/tracing/sse`: sequence notification transport only
-- `/tracing/requests/stream`: live request-summary projection transport only
+- `/tracing/request-summaries/stream`: live request-summary projection transport only
 
 The authoritative facts still come from the persisted tracing tables and blobs.
 
@@ -37,6 +36,7 @@ Notes:
 - `tracing.dir` is the base directory for `tracing.db` and `tracing/bodies/`
 - `body-inline-max-bytes` controls when a blob stays inline in SQLite vs spills to file
 - `max-body-bytes: 0` means no truncation
+- `emit-sse` controls whether `/tracing/request-summaries/stream` emits live summary events
 - changes to tracing config currently require a CLIProxyAPI restart
 
 ## APIs
@@ -46,11 +46,14 @@ Notes:
 These are the preferred APIs for request-list UIs and live inspection tools:
 
 - `GET /v0/management/tracing/requests?limit=<n>&offset=<n>&search=<q>&status=<all|success|failure>&provider=<name>&requested_model=<name>&has_usage_only=<bool>&stream_only=<bool>`
+- `GET /v0/management/tracing/requests/:request_id/summary`
 - `GET /v0/management/tracing/requests/:request_id/detail`
 - `DELETE /v0/management/tracing/requests/:request_id`
-- `GET /v0/management/tracing/requests/stream`
+- `GET /v0/management/tracing/request-summaries/stream`
 
 `/tracing/requests` returns a projected summary page optimized for list queries.
+
+`/tracing/requests/:request_id/summary` returns the current projected summary row for one request.
 
 `/tracing/requests/:request_id/detail` returns a single aggregated payload that includes:
 
@@ -60,22 +63,26 @@ These are the preferred APIs for request-list UIs and live inspection tools:
 - request / response blob metadata
 - attempt request / response blob metadata
 
-`/tracing/requests/stream` emits:
+`/tracing/request-summaries/stream` emits:
 
 - `ready`
-- `upsert`
-- `delete`
+- `started`
+- `updated`
+- `ended`
+- `deleted`
 
-Each `upsert` carries the latest full summary snapshot for one `request_id`.
+- `started` carries the first full summary snapshot for a request row
+- `updated` carries an in-flight full-row replacement snapshot
+- `ended` carries the single terminal full-row snapshot after final usage has been merged
+- `deleted` removes a row by `request_id`
 
 ### Durable incremental APIs
 
-These remain available for consumers that maintain their own local projection and checkpoint:
+This remains available for consumers that maintain their own local projection and checkpoint:
 
 - `GET /v0/management/tracing/events?after_seq=<n>&limit=<m>`
-- `GET /v0/management/tracing/sse`
 
-`/tracing/sse` is only a notification stream for new `latest_seq` values. It is not a replay source.
+Clients that need durable mirroring should poll `/tracing/events`; there is no separate sequence-notification stream.
 
 ### Record detail APIs
 
@@ -103,14 +110,15 @@ Use this for request lists, detail pages, and live operator tools.
 1. Load the initial request list from `/tracing/requests`
 2. Open request detail on demand via `/tracing/requests/:request_id/detail`
 3. Fetch blob payloads only when the UI actually needs them
-4. Connect `/tracing/requests/stream`
-5. Apply `upsert` and `delete` events by `request_id`
-6. Treat each `upsert` as full replacement of the previous summary row for that request
+4. Connect `/tracing/request-summaries/stream`
+5. Apply `started`, `updated`, `ended`, and `deleted` by `request_id`
+6. Treat `started`, `updated`, and `ended` as full-row replacements; treat `ended` as the only completion signal
 
 Important notes:
 
 - `ready` only means the stream is live; it is not a historical replay
-- the same request can emit multiple `upsert` events while it is still running
+- the same request can emit multiple `updated` events while it is still running
+- `ended` is the only authoritative terminal event for a request row
 - if the stream disconnects and you only need current live state, reload `/tracing/requests`
 - if you need exact catch-up semantics, use Flow B instead
 
@@ -122,10 +130,9 @@ Use this only if your project needs its own persistent local projection with cra
 2. On startup, call `/tracing/events?after_seq=<last_seq>`
 3. Apply events in ascending `seq`
 4. Advance `last_seq` only after the local transaction commits
-5. Connect `/tracing/sse`
-6. When `/tracing/sse` signals a newer `latest_seq`, return to `/tracing/events`
+5. Poll `/tracing/events` again on your own schedule
 
-Do not treat SSE as the only source of truth.
+Do not treat request-summary SSE as the only source of truth.
 
 ## Summary stream semantics
 
@@ -133,10 +140,25 @@ The request-summary stream is derived from the authoritative tracing tables. It 
 
 Important behaviors:
 
-- multiple `upsert` events for the same request are expected
-- updates can occur on request start, route changes, attempt lifecycle changes, response metadata changes, request finalization, and usage finalization
-- `latest_seq` may repeat across multiple summary `upsert` events because it tracks the latest committed row in `trace_event`, not the number of summary publishes
+- every request row begins with `started`
+- multiple `updated` events for the same request are expected while it is in progress
+- request finalization does not publish a pre-terminal summary; the terminal snapshot is emitted once as `ended` after final usage is merged
+- `latest_seq` may repeat across multiple summary events because it tracks the latest committed row in `trace_event`, not the number of summary publishes
 - consumers should always key summary rows by `request_id`
+
+## Client migration
+
+Clients must upgrade in lockstep with the backend for this protocol change.
+
+- stream URL changes from `/tracing/requests/stream` to `/tracing/request-summaries/stream`
+- replace `upsert` handling with:
+  - `started`: create row
+  - `updated`: replace row
+  - `ended`: replace row and mark terminal
+  - `deleted`: remove row
+- stop assuming the first event is `upsert`
+- stop inferring completion from the last `upsert` or `request_status != running` inside an update
+- treat `ended` as the only reliable completion signal
 
 ## Semantics
 
@@ -250,13 +272,14 @@ Choose one integration mode:
 
 1. Live UI mode
    - Use GET /v0/management/tracing/requests for list queries
+   - Use GET /v0/management/tracing/requests/:request_id/summary when you only need the projected summary row
    - Use GET /v0/management/tracing/requests/:request_id/detail for detail pages
-   - Use GET /v0/management/tracing/requests/stream for ready/upsert/delete live updates
-   - Treat each upsert as full replacement keyed by request_id
+   - Use GET /v0/management/tracing/request-summaries/stream for ready/started/updated/ended/deleted live updates
+   - Treat `ended` as the only completion signal and all non-delete payloads as full-row replacements keyed by request_id
 
 2. Durable mirror mode
    - Use GET /v0/management/tracing/events?after_seq=<n>&limit=<m> as the only incremental replay source
-   - Use GET /v0/management/tracing/sse as notification only
+   - Poll `/tracing/events` at a cadence that matches your freshness requirements
    - Persist last_seq and advance it only after local commit
 
 Requirements:

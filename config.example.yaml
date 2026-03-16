@@ -78,7 +78,7 @@ tracing:
   body-inline-max-bytes: 65536
   # Maximum captured bytes per body. 0 means no truncation.
   max-body-bytes: 0
-  # Emit SSE notifications after tracing events are committed to SQLite.
+  # Emit request summary SSE events for /v0/management/tracing/request-summaries/stream.
   emit-sse: true
   # Remove old tracing data when > 0. 0 disables automatic pruning.
   prune-days: 0

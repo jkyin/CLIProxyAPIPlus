@@ -5,11 +5,41 @@ import (
 	"database/sql"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/tracing"
 )
+
+func readRequestSummaryEvent(t *testing.T, ch <-chan tracing.RequestSummaryEvent) tracing.RequestSummaryEvent {
+	t.Helper()
+
+	select {
+	case event, ok := <-ch:
+		if !ok {
+			t.Fatal("summary event channel closed")
+		}
+		return event
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for summary event")
+	}
+
+	return tracing.RequestSummaryEvent{}
+}
+
+func requireNoRequestSummaryEvent(t *testing.T, ch <-chan tracing.RequestSummaryEvent) {
+	t.Helper()
+
+	select {
+	case event, ok := <-ch:
+		if !ok {
+			return
+		}
+		t.Fatalf("unexpected summary event: %#v", event)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
 
 func TestStorePersistsRequestAttemptAndUsage(t *testing.T) {
 	ctx := context.Background()
@@ -169,6 +199,133 @@ func TestStorePersistsRequestAttemptAndUsage(t *testing.T) {
 
 	if filepath.Base(store.DBPath()) != "tracing.db" {
 		t.Fatalf("DBPath() = %q, want tracing.db suffix", store.DBPath())
+	}
+}
+
+func TestStoreRequestSummaryEventLifecycle(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := New(ctx, Config{BaseDir: dir, EmitSSE: true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ch, cancel := store.SubscribeRequestSummaries()
+	defer cancel()
+
+	requestID := tracing.MustNewID()
+	startedAt := time.Now().UTC().Truncate(time.Millisecond)
+	finishedAt := startedAt.Add(800 * time.Millisecond)
+
+	if err := store.StartRequest(ctx, tracing.RequestStart{
+		RequestID:      requestID,
+		StartedAt:      startedAt,
+		Method:         http.MethodPost,
+		Scheme:         "http",
+		Host:           "localhost:8317",
+		Path:           "/v1/chat/completions",
+		IsStream:       true,
+		HandlerType:    "openai",
+		RequestedModel: "gpt-5",
+	}); err != nil {
+		t.Fatalf("StartRequest() error = %v", err)
+	}
+
+	startedEvent := readRequestSummaryEvent(t, ch)
+	if startedEvent.Type != tracing.RequestSummaryEventStarted {
+		t.Fatalf("started event type = %q, want %q", startedEvent.Type, tracing.RequestSummaryEventStarted)
+	}
+	if startedEvent.RequestID != requestID {
+		t.Fatalf("started event request_id = %q, want %q", startedEvent.RequestID, requestID)
+	}
+	if startedEvent.StartedAtNS != startedAt.UnixNano() {
+		t.Fatalf("started event started_at_ns = %d, want %d", startedEvent.StartedAtNS, startedAt.UnixNano())
+	}
+	if startedEvent.Summary == nil || startedEvent.Summary.RequestStatus != tracing.RequestStatusRunning {
+		t.Fatalf("started event summary = %#v, want running summary", startedEvent.Summary)
+	}
+
+	if err := store.UpdateRequestRoute(ctx, requestID, tracing.RequestRouteInfo{
+		IsStream:            true,
+		HandlerType:         "openai",
+		RequestedModel:      "gpt-5.4",
+		ClientCorrelationID: "corr-1",
+	}); err != nil {
+		t.Fatalf("UpdateRequestRoute() error = %v", err)
+	}
+
+	updatedEvent := readRequestSummaryEvent(t, ch)
+	if updatedEvent.Type != tracing.RequestSummaryEventUpdated {
+		t.Fatalf("updated event type = %q, want %q", updatedEvent.Type, tracing.RequestSummaryEventUpdated)
+	}
+	if updatedEvent.Summary == nil || updatedEvent.Summary.RequestedModel != "gpt-5.4" {
+		t.Fatalf("updated event summary = %#v, want requested_model updated", updatedEvent.Summary)
+	}
+
+	if err := store.FinalizeRequest(ctx, tracing.RequestFinish{
+		RequestID:   requestID,
+		StatusCode:  200,
+		Status:      tracing.RequestStatusSucceeded,
+		FinishedAt:  finishedAt,
+		FirstByteAt: startedAt.Add(100 * time.Millisecond),
+	}); err != nil {
+		t.Fatalf("FinalizeRequest() error = %v", err)
+	}
+
+	requireNoRequestSummaryEvent(t, ch)
+
+	if err := store.FinalizeUsage(ctx, tracing.UsageFinal{
+		RequestID:       requestID,
+		FinalizedAt:     finishedAt,
+		Status:          "success",
+		Completeness:    tracing.UsageCompletenessComplete,
+		InputTokens:     10,
+		OutputTokens:    20,
+		ReasoningTokens: 5,
+		CachedTokens:    3,
+		TotalTokens:     35,
+	}); err != nil {
+		t.Fatalf("FinalizeUsage() error = %v", err)
+	}
+
+	endedEvent := readRequestSummaryEvent(t, ch)
+	if endedEvent.Type != tracing.RequestSummaryEventEnded {
+		t.Fatalf("ended event type = %q, want %q", endedEvent.Type, tracing.RequestSummaryEventEnded)
+	}
+	if endedEvent.RequestStatus != tracing.RequestStatusSucceeded {
+		t.Fatalf("ended event request_status = %q, want %q", endedEvent.RequestStatus, tracing.RequestStatusSucceeded)
+	}
+	if endedEvent.EndedAtNS != finishedAt.UnixNano() {
+		t.Fatalf("ended event ended_at_ns = %d, want %d", endedEvent.EndedAtNS, finishedAt.UnixNano())
+	}
+	if endedEvent.Summary == nil {
+		t.Fatal("ended event summary = nil, want final summary")
+	}
+	if endedEvent.Summary.TotalTokens == nil || *endedEvent.Summary.TotalTokens != 35 {
+		t.Fatalf("ended event total_tokens = %#v, want 35", endedEvent.Summary.TotalTokens)
+	}
+	if endedEvent.Summary.UsageCompleteness != tracing.UsageCompletenessComplete {
+		t.Fatalf("ended event usage_completeness = %q, want %q", endedEvent.Summary.UsageCompleteness, tracing.UsageCompletenessComplete)
+	}
+
+	deleted, err := store.DeleteRequest(ctx, requestID)
+	if err != nil {
+		t.Fatalf("DeleteRequest() error = %v", err)
+	}
+	if !deleted {
+		t.Fatal("DeleteRequest() = false, want true")
+	}
+
+	deletedEvent := readRequestSummaryEvent(t, ch)
+	if deletedEvent.Type != tracing.RequestSummaryEventDeleted {
+		t.Fatalf("deleted event type = %q, want %q", deletedEvent.Type, tracing.RequestSummaryEventDeleted)
+	}
+	if deletedEvent.RequestID != requestID {
+		t.Fatalf("deleted event request_id = %q, want %q", deletedEvent.RequestID, requestID)
+	}
+	if deletedEvent.Summary != nil {
+		t.Fatalf("deleted event summary = %#v, want nil", deletedEvent.Summary)
 	}
 }
 
@@ -360,6 +517,16 @@ func TestStoreRequestSummariesDetailAndDelete(t *testing.T) {
 	if summary.TotalTokens == nil || *summary.TotalTokens != 40 {
 		t.Fatalf("summary.TotalTokens = %#v, want 40", summary.TotalTokens)
 	}
+	summaryByID, err := store.GetRequestSummary(ctx, requestID)
+	if err != nil {
+		t.Fatalf("GetRequestSummary() error = %v", err)
+	}
+	if summaryByID == nil {
+		t.Fatal("GetRequestSummary() = nil, want summary")
+	}
+	if !reflect.DeepEqual(*summaryByID, summary) {
+		t.Fatalf("GetRequestSummary() = %#v, want %#v", *summaryByID, summary)
+	}
 
 	detail, err := store.GetRequestDetail(ctx, requestID)
 	if err != nil {
@@ -388,6 +555,13 @@ func TestStoreRequestSummariesDetailAndDelete(t *testing.T) {
 	}
 	if len(deletedSummaryPage.Items) != 0 {
 		t.Fatalf("ListRequestSummaries(after delete) = %#v, want empty", deletedSummaryPage.Items)
+	}
+	deletedSummary, err := store.GetRequestSummary(ctx, requestID)
+	if err != nil {
+		t.Fatalf("GetRequestSummary(after delete) error = %v", err)
+	}
+	if deletedSummary != nil {
+		t.Fatalf("GetRequestSummary(after delete) = %#v, want nil", deletedSummary)
 	}
 	blobRecord, err := store.GetBlob(ctx, responseBlob.BlobID)
 	if err != nil {

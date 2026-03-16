@@ -302,17 +302,22 @@ type RequestDetailRecord struct {
 }
 
 const (
-	RequestSummaryEventReady  = "ready"
-	RequestSummaryEventUpsert = "upsert"
-	RequestSummaryEventDelete = "delete"
+	RequestSummaryEventReady   = "ready"
+	RequestSummaryEventStarted = "started"
+	RequestSummaryEventUpdated = "updated"
+	RequestSummaryEventEnded   = "ended"
+	RequestSummaryEventDeleted = "deleted"
 )
 
 type RequestSummaryEvent struct {
-	Type      string                `json:"type"`
-	RequestID string                `json:"request_id,omitempty"`
-	Summary   *RequestSummaryRecord `json:"summary,omitempty"`
-	LatestSeq int64                 `json:"latest_seq"`
-	TS        string                `json:"ts"`
+	Type          string                `json:"type"`
+	RequestID     string                `json:"request_id,omitempty"`
+	RequestStatus string                `json:"request_status,omitempty"`
+	StartedAtNS   int64                 `json:"started_at_ns,omitempty"`
+	EndedAtNS     int64                 `json:"ended_at_ns,omitempty"`
+	Summary       *RequestSummaryRecord `json:"summary,omitempty"`
+	LatestSeq     int64                 `json:"latest_seq"`
+	TS            string                `json:"ts"`
 }
 
 type Recorder interface {
@@ -331,10 +336,10 @@ type Recorder interface {
 	FinalizeUsage(ctx context.Context, final UsageFinal) error
 	SaveBlob(ctx context.Context, blob *BlobRecord) error
 	LatestSeq() int64
-	Subscribe() (<-chan int64, func())
 	Status(ctx context.Context) (StatusRecord, error)
 	ListEvents(ctx context.Context, afterSeq int64, limit int) ([]EventRecord, error)
 	ListRequestSummaries(ctx context.Context, filter RequestSummaryFilter) (RequestSummaryPage, error)
+	GetRequestSummary(ctx context.Context, requestID string) (*RequestSummaryRecord, error)
 	GetRequest(ctx context.Context, requestID string) (*RequestRecord, error)
 	GetRequestDetail(ctx context.Context, requestID string) (*RequestDetailRecord, error)
 	ListAttempts(ctx context.Context, requestID string) ([]AttemptRecord, error)

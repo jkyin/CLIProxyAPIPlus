@@ -5,7 +5,7 @@
 注意：
 
 - 以下 JSON 只是结构示例，不保证字段值完全一致
-- `/tracing/requests` 和 `/tracing/requests/:request_id/detail` 是当前推荐的 live 查询接口
+- `/tracing/requests`、`/tracing/requests/:request_id/summary` 和 `/tracing/requests/:request_id/detail` 是当前推荐的 live 查询接口
 - `/tracing/events` 仍然保留给需要自建 durable local projection 的消费端
 
 ## 1. 状态接口
@@ -60,6 +60,41 @@
   ],
   "total_count": 42,
   "next_offset": 2
+}
+```
+
+### 单条 request summary 接口
+
+`GET /v0/management/tracing/requests/:request_id/summary`
+
+```json
+{
+  "summary": {
+    "request_id": "01958f9c-4b01-7869-a4de-4d2c1dcad4c7",
+    "started_at_ns": 1741750401000000000,
+    "provider": "codex",
+    "requested_model": "gpt-5",
+    "route_model": "gpt-5",
+    "upstream_model": "gpt-5-codex",
+    "auth_label": "codex-main",
+    "auth_account": "user@example.com",
+    "auth_path": "/Users/demo/.codex/auth.json",
+    "auth_index": "a8f239bc12d013fe",
+    "http_method": "POST",
+    "http_path": "/v1/chat/completions",
+    "http_query": "",
+    "status_code": 200,
+    "duration_ms": 812,
+    "input_tokens": 1280,
+    "output_tokens": 412,
+    "total_tokens": 1784,
+    "reasoning_tokens": 92,
+    "cached_tokens": 256,
+    "request_status": "succeeded",
+    "usage_completeness": "complete",
+    "is_stream": true,
+    "updated_at_ns": 1741750401812000000
+  }
 }
 ```
 
@@ -288,32 +323,26 @@
 
 ## 9. request summary 实时流
 
-`GET /v0/management/tracing/requests/stream`
+`GET /v0/management/tracing/request-summaries/stream`
 
 ```text
 event: ready
 data: {"type":"ready","latest_seq":12834,"ts":"2026-03-12T14:00:00.100000Z"}
 
-event: upsert
-data: {"type":"upsert","request_id":"01958f9c-4b01-7869-a4de-4d2c1dcad4c7","summary":{"request_id":"01958f9c-4b01-7869-a4de-4d2c1dcad4c7","started_at_ns":1741750401000000000,"provider":"codex","requested_model":"gpt-5","http_method":"POST","http_path":"/v1/chat/completions","request_status":"running","is_stream":true,"updated_at_ns":1741750401050000000},"latest_seq":12834,"ts":"2026-03-12T14:00:00.150000Z"}
+event: started
+data: {"type":"started","request_id":"01958f9c-4b01-7869-a4de-4d2c1dcad4c7","started_at_ns":1741750401000000000,"summary":{"request_id":"01958f9c-4b01-7869-a4de-4d2c1dcad4c7","started_at_ns":1741750401000000000,"requested_model":"gpt-5","http_method":"POST","http_path":"/v1/chat/completions","request_status":"running","is_stream":true,"updated_at_ns":1741750401000000000},"latest_seq":12834,"ts":"2026-03-12T14:00:00.150000Z"}
 
-event: delete
-data: {"type":"delete","request_id":"01958f9c-4b01-7869-a4de-4d2c1dcad4c7","latest_seq":12840,"ts":"2026-03-12T14:00:05.000000Z"}
+event: updated
+data: {"type":"updated","request_id":"01958f9c-4b01-7869-a4de-4d2c1dcad4c7","summary":{"request_id":"01958f9c-4b01-7869-a4de-4d2c1dcad4c7","started_at_ns":1741750401000000000,"provider":"codex","requested_model":"gpt-5","route_model":"gpt-5","http_method":"POST","http_path":"/v1/chat/completions","request_status":"running","is_stream":true,"updated_at_ns":1741750401050000000},"latest_seq":12834,"ts":"2026-03-12T14:00:00.220000Z"}
+
+event: ended
+data: {"type":"ended","request_id":"01958f9c-4b01-7869-a4de-4d2c1dcad4c7","request_status":"succeeded","ended_at_ns":1741750401800000000,"summary":{"request_id":"01958f9c-4b01-7869-a4de-4d2c1dcad4c7","started_at_ns":1741750401000000000,"provider":"codex","requested_model":"gpt-5","route_model":"gpt-5","upstream_model":"gpt-5-codex","http_method":"POST","http_path":"/v1/chat/completions","status_code":200,"duration_ms":812,"input_tokens":1280,"output_tokens":412,"total_tokens":1784,"reasoning_tokens":92,"cached_tokens":256,"request_status":"succeeded","usage_completeness":"complete","is_stream":true,"updated_at_ns":1741750401812000000},"latest_seq":12835,"ts":"2026-03-12T14:00:01.234567Z"}
+
+event: deleted
+data: {"type":"deleted","request_id":"01958f9c-4b01-7869-a4de-4d2c1dcad4c7","latest_seq":12840,"ts":"2026-03-12T14:00:05.000000Z"}
 ```
 
-## 10. 旧的 seq SSE 通知流
-
-`GET /v0/management/tracing/sse`
-
-```text
-event: ready
-data: {"latest_seq":12834}
-
-event: seq
-data: {"latest_seq":12835,"ts":"2026-03-12T14:00:01.234567Z"}
-```
-
-## 11. 删除请求接口
+## 10. 删除请求接口
 
 `DELETE /v0/management/tracing/requests/:request_id`
 

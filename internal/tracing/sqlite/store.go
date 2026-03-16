@@ -35,9 +35,6 @@ type Store struct {
 
 	latestSeq atomic.Int64
 
-	subMu sync.Mutex
-	subs  map[chan int64]struct{}
-
 	summarySubMu sync.Mutex
 	summarySubs  map[chan tracing.RequestSummaryEvent]struct{}
 }
@@ -70,7 +67,6 @@ func New(ctx context.Context, cfg Config) (*Store, error) {
 		dbPath:      dbPath,
 		bodiesDir:   filepath.Join(baseDir, "bodies"),
 		emitSSE:     cfg.EmitSSE,
-		subs:        make(map[chan int64]struct{}),
 		summarySubs: make(map[chan tracing.RequestSummaryEvent]struct{}),
 	}
 	if err := os.MkdirAll(store.bodiesDir, 0o755); err != nil {
@@ -116,24 +112,6 @@ func (s *Store) DBPath() string    { return s.dbPath }
 func (s *Store) BodiesDir() string { return s.bodiesDir }
 func (s *Store) LatestSeq() int64  { return s.latestSeq.Load() }
 
-func (s *Store) Subscribe() (<-chan int64, func()) {
-	ch := make(chan int64, 16)
-	if s == nil || !s.emitSSE {
-		close(ch)
-		return ch, func() {}
-	}
-	s.subMu.Lock()
-	s.subs[ch] = struct{}{}
-	s.subMu.Unlock()
-	cancel := func() {
-		s.subMu.Lock()
-		delete(s.subs, ch)
-		s.subMu.Unlock()
-		close(ch)
-	}
-	return ch, cancel
-}
-
 func (s *Store) SubscribeRequestSummaries() (<-chan tracing.RequestSummaryEvent, func()) {
 	ch := make(chan tracing.RequestSummaryEvent, 32)
 	if s == nil || !s.emitSSE {
@@ -156,7 +134,7 @@ func (s *Store) StartRequest(ctx context.Context, start tracing.RequestStart) er
 	if s == nil {
 		return nil
 	}
-	return s.writeAndPublishRequestSummary(ctx, start.RequestID, func(tx *sql.Tx) error {
+	return s.writeAndPublishRequestSummary(ctx, start.RequestID, s.publishStartedRequestSummary, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO trace_request (
 				request_id, legacy_request_id, started_at_ns, finished_at_ns, status,
@@ -177,7 +155,7 @@ func (s *Store) UpdateRequestRoute(ctx context.Context, requestID string, route 
 	if s == nil {
 		return nil
 	}
-	return s.writeAndPublishRequestSummary(ctx, requestID, func(tx *sql.Tx) error {
+	return s.writeAndPublishRequestSummary(ctx, requestID, s.publishUpdatedRequestSummary, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			UPDATE trace_request
 			SET is_stream = ?, handler_type = ?, requested_model = ?, client_correlation_id = ?
@@ -202,7 +180,6 @@ func (s *Store) RecordRequestEvent(ctx context.Context, requestID, attemptID, ev
 	seq, err := result.LastInsertId()
 	if err == nil {
 		s.latestSeq.Store(seq)
-		s.broadcast(seq)
 	}
 	return nil
 }
@@ -211,7 +188,7 @@ func (s *Store) BeginAttempt(ctx context.Context, start tracing.AttemptStart) er
 	if s == nil {
 		return nil
 	}
-	return s.writeAndPublishRequestSummary(ctx, start.RequestID, func(tx *sql.Tx) error {
+	return s.writeAndPublishRequestSummary(ctx, start.RequestID, s.publishUpdatedRequestSummary, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO trace_attempt (
 				attempt_id, request_id, attempt_no, retry_scope, provider, executor_id,
@@ -233,7 +210,7 @@ func (s *Store) UpdateAttemptRequest(ctx context.Context, request tracing.Attemp
 	if s == nil {
 		return nil
 	}
-	return s.writeAndPublishAttemptSummary(ctx, request.AttemptID, func(tx *sql.Tx) error {
+	return s.writeAndPublishAttemptSummary(ctx, request.AttemptID, s.publishUpdatedRequestSummary, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			UPDATE trace_attempt
 			SET upstream_url = ?, upstream_method = ?, upstream_protocol = ?,
@@ -249,7 +226,7 @@ func (s *Store) UpdateAttemptResponse(ctx context.Context, response tracing.Atte
 	if s == nil {
 		return nil
 	}
-	return s.writeAndPublishAttemptSummary(ctx, response.AttemptID, func(tx *sql.Tx) error {
+	return s.writeAndPublishAttemptSummary(ctx, response.AttemptID, s.publishUpdatedRequestSummary, func(tx *sql.Tx) error {
 		sets := make([]string, 0, 5)
 		args := make([]any, 0, 6)
 		if response.StatusCode > 0 {
@@ -286,7 +263,7 @@ func (s *Store) FinishAttempt(ctx context.Context, finish tracing.AttemptFinish)
 	if s == nil {
 		return nil
 	}
-	return s.writeAndPublishAttemptSummary(ctx, finish.AttemptID, func(tx *sql.Tx) error {
+	return s.writeAndPublishAttemptSummary(ctx, finish.AttemptID, s.publishUpdatedRequestSummary, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			UPDATE trace_attempt
 			SET finished_at_ns = ?, outcome = ?, status_code = CASE WHEN ? > 0 THEN ? ELSE status_code END,
@@ -306,7 +283,7 @@ func (s *Store) FinalizeRequest(ctx context.Context, finish tracing.RequestFinis
 	if state == "" {
 		state = tracing.RequestStatusSucceeded
 	}
-	return s.writeAndPublishRequestSummary(ctx, finish.RequestID, func(tx *sql.Tx) error {
+	return s.writeAndPublishRequestSummary(ctx, finish.RequestID, s.publishEndedRequestSummaryIfReady, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			UPDATE trace_request
 			SET finished_at_ns = ?, status = ?, downstream_status_code = ?,
@@ -327,7 +304,7 @@ func (s *Store) FinalizeUsage(ctx context.Context, final tracing.UsageFinal) err
 	reasoningTokens := nullableUsageMetric(final.Completeness, final.ReasoningTokens)
 	cachedTokens := nullableUsageMetric(final.Completeness, final.CachedTokens)
 	totalTokens := nullableUsageMetric(final.Completeness, final.TotalTokens)
-	return s.writeAndPublishRequestSummary(ctx, final.RequestID, func(tx *sql.Tx) error {
+	return s.writeAndPublishRequestSummary(ctx, final.RequestID, s.publishSummaryAfterUsageFinalize, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO trace_usage_final (
 				request_id, attempt_id, finalized_at_ns, status, completeness, input_tokens,
@@ -486,6 +463,10 @@ func (s *Store) ListRequestSummaries(ctx context.Context, filter tracing.Request
 		TotalCount: totalCount,
 		NextOffset: nextOffset,
 	}, nil
+}
+
+func (s *Store) GetRequestSummary(ctx context.Context, requestID string) (*tracing.RequestSummaryRecord, error) {
+	return s.getRequestSummary(ctx, requestID)
 }
 
 func (s *Store) GetRequestDetail(ctx context.Context, requestID string) (*tracing.RequestDetailRecord, error) {
@@ -1178,7 +1159,7 @@ func (s *Store) DeleteRequest(ctx context.Context, requestID string) (bool, erro
 		_ = os.Remove(filepath.Join(filepath.Dir(s.dbPath), relPath))
 	}
 	s.broadcastRequestSummaryEvent(tracing.RequestSummaryEvent{
-		Type:      tracing.RequestSummaryEventDelete,
+		Type:      tracing.RequestSummaryEventDeleted,
 		RequestID: requestID,
 		LatestSeq: s.latestSeq.Load(),
 		TS:        time.Now().UTC().Format(time.RFC3339Nano),
@@ -1207,7 +1188,9 @@ func (s *Store) withWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) erro
 	return nil
 }
 
-func (s *Store) writeAndPublishRequestSummary(ctx context.Context, requestID string, fn func(tx *sql.Tx) error) error {
+type requestSummaryPublisher func(context.Context, string)
+
+func (s *Store) writeAndPublishRequestSummary(ctx context.Context, requestID string, publish requestSummaryPublisher, fn func(tx *sql.Tx) error) error {
 	if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		if err := fn(tx); err != nil {
 			return err
@@ -1216,11 +1199,13 @@ func (s *Store) writeAndPublishRequestSummary(ctx context.Context, requestID str
 	}); err != nil {
 		return err
 	}
-	s.publishRequestSummary(ctx, requestID)
+	if publish != nil {
+		publish(ctx, requestID)
+	}
 	return nil
 }
 
-func (s *Store) writeAndPublishAttemptSummary(ctx context.Context, attemptID string, fn func(tx *sql.Tx) error) error {
+func (s *Store) writeAndPublishAttemptSummary(ctx context.Context, attemptID string, publish requestSummaryPublisher, fn func(tx *sql.Tx) error) error {
 	var requestID string
 	if err := s.withWriteTx(ctx, func(tx *sql.Tx) error {
 		if err := fn(tx); err != nil {
@@ -1239,23 +1224,106 @@ func (s *Store) writeAndPublishAttemptSummary(ctx context.Context, attemptID str
 		return err
 	}
 	if requestID != "" {
-		s.publishRequestSummary(ctx, requestID)
+		if publish != nil {
+			publish(ctx, requestID)
+		}
 	}
 	return nil
 }
 
-func (s *Store) publishRequestSummary(ctx context.Context, requestID string) {
+type requestSummaryEventSnapshot struct {
+	request *tracing.RequestRecord
+	summary *tracing.RequestSummaryRecord
+}
+
+func (s *Store) loadRequestSummaryEventSnapshot(ctx context.Context, requestID string) (*requestSummaryEventSnapshot, error) {
+	requestRecord, err := s.GetRequest(ctx, requestID)
+	if err != nil || requestRecord == nil {
+		return nil, err
+	}
 	summary, err := s.getRequestSummary(ctx, requestID)
 	if err != nil || summary == nil {
-		return
+		return nil, err
 	}
-	s.broadcastRequestSummaryEvent(tracing.RequestSummaryEvent{
-		Type:      tracing.RequestSummaryEventUpsert,
-		RequestID: requestID,
-		Summary:   summary,
+	return &requestSummaryEventSnapshot{
+		request: requestRecord,
+		summary: summary,
+	}, nil
+}
+
+func (s *Store) newRequestSummaryEvent(snapshot *requestSummaryEventSnapshot, eventType string) *tracing.RequestSummaryEvent {
+	if snapshot == nil || snapshot.request == nil || snapshot.summary == nil {
+		return nil
+	}
+	event := &tracing.RequestSummaryEvent{
+		Type:      eventType,
+		RequestID: snapshot.summary.RequestID,
+		Summary:   snapshot.summary,
 		LatestSeq: s.latestSeq.Load(),
 		TS:        time.Now().UTC().Format(time.RFC3339Nano),
-	})
+	}
+	switch eventType {
+	case tracing.RequestSummaryEventStarted:
+		event.StartedAtNS = snapshot.request.StartedAtNS
+	case tracing.RequestSummaryEventEnded:
+		event.RequestStatus = snapshot.summary.RequestStatus
+		event.EndedAtNS = snapshot.request.FinishedAtNS
+	}
+	return event
+}
+
+func (s *Store) publishStartedRequestSummary(ctx context.Context, requestID string) {
+	s.publishRequestSummaryEvent(ctx, requestID, tracing.RequestSummaryEventStarted)
+}
+
+func (s *Store) publishUpdatedRequestSummary(ctx context.Context, requestID string) {
+	s.publishRequestSummaryEvent(ctx, requestID, tracing.RequestSummaryEventUpdated)
+}
+
+func (s *Store) publishEndedRequestSummaryIfReady(ctx context.Context, requestID string) {
+	snapshot, err := s.loadRequestSummaryEventSnapshot(ctx, requestID)
+	if err != nil || snapshot == nil {
+		return
+	}
+	if snapshot.request.FinishedAtNS == 0 || strings.TrimSpace(snapshot.summary.RequestStatus) == tracing.RequestStatusRunning {
+		return
+	}
+	if strings.TrimSpace(snapshot.summary.UsageCompleteness) == "" {
+		return
+	}
+	event := s.newRequestSummaryEvent(snapshot, tracing.RequestSummaryEventEnded)
+	if event == nil {
+		return
+	}
+	s.broadcastRequestSummaryEvent(*event)
+}
+
+func (s *Store) publishSummaryAfterUsageFinalize(ctx context.Context, requestID string) {
+	snapshot, err := s.loadRequestSummaryEventSnapshot(ctx, requestID)
+	if err != nil || snapshot == nil {
+		return
+	}
+	eventType := tracing.RequestSummaryEventUpdated
+	if snapshot.request.FinishedAtNS != 0 && strings.TrimSpace(snapshot.summary.RequestStatus) != tracing.RequestStatusRunning {
+		eventType = tracing.RequestSummaryEventEnded
+	}
+	event := s.newRequestSummaryEvent(snapshot, eventType)
+	if event == nil {
+		return
+	}
+	s.broadcastRequestSummaryEvent(*event)
+}
+
+func (s *Store) publishRequestSummaryEvent(ctx context.Context, requestID, eventType string) {
+	snapshot, err := s.loadRequestSummaryEventSnapshot(ctx, requestID)
+	if err != nil || snapshot == nil {
+		return
+	}
+	event := s.newRequestSummaryEvent(snapshot, eventType)
+	if event == nil {
+		return
+	}
+	s.broadcastRequestSummaryEvent(*event)
 }
 
 func (s *Store) rebuildRequestSummaries(ctx context.Context) error {
@@ -1802,20 +1870,6 @@ func scanRequestSummary(scanner rowScanner) (tracing.RequestSummaryRecord, error
 	record.CachedTokens = nullInt64Ptr(cachedTokens)
 	record.IsStream = isStream != 0
 	return record, nil
-}
-
-func (s *Store) broadcast(seq int64) {
-	if s == nil || !s.emitSSE {
-		return
-	}
-	s.subMu.Lock()
-	defer s.subMu.Unlock()
-	for ch := range s.subs {
-		select {
-		case ch <- seq:
-		default:
-		}
-	}
 }
 
 func (s *Store) broadcastRequestSummaryEvent(event tracing.RequestSummaryEvent) {

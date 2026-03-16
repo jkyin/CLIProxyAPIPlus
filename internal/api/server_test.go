@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +14,8 @@ import (
 	gin "github.com/gin-gonic/gin"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/tracing"
+	tracingsqlite "github.com/router-for-me/CLIProxyAPI/v6/internal/tracing/sqlite"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -109,6 +113,149 @@ func TestAmpProviderModelRoutes(t *testing.T) {
 				t.Fatalf("response body for %s missing %q: %s", tc.path, tc.wantContains, body)
 			}
 		})
+	}
+}
+
+func TestTracingRequestSummaryRoute(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "probe-secret")
+
+	ctx := context.Background()
+	store, err := tracingsqlite.New(ctx, tracingsqlite.Config{BaseDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("failed to create tracing store: %v", err)
+	}
+	defer func() {
+		if errClose := store.Close(); errClose != nil {
+			t.Fatalf("failed to close tracing store: %v", errClose)
+		}
+	}()
+
+	previousRecorder := tracing.DefaultRecorder()
+	tracing.SetDefaultRecorder(store)
+	defer tracing.SetDefaultRecorder(previousRecorder)
+
+	requestID := "server-summary-1"
+	startedAt := time.Unix(1741750401, 0).UTC()
+	if errStart := store.StartRequest(ctx, tracing.RequestStart{
+		RequestID:      requestID,
+		StartedAt:      startedAt,
+		Method:         http.MethodPost,
+		Scheme:         "http",
+		Host:           "127.0.0.1:8317",
+		Path:           "/v1/chat/completions",
+		IsStream:       true,
+		HandlerType:    "openai",
+		RequestedModel: "gpt-5",
+	}); errStart != nil {
+		t.Fatalf("StartRequest() error = %v", errStart)
+	}
+
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/tracing/requests/"+requestID+"/summary", nil)
+	req.Header.Set("X-Management-Key", "probe-secret")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	var payload struct {
+		Summary tracing.RequestSummaryRecord `json:"summary"`
+	}
+	if errDecode := json.Unmarshal(rr.Body.Bytes(), &payload); errDecode != nil {
+		t.Fatalf("failed to decode response: %v", errDecode)
+	}
+	if payload.Summary.RequestID != requestID {
+		t.Fatalf("summary.RequestID = %q, want %q", payload.Summary.RequestID, requestID)
+	}
+	if payload.Summary.RequestedModel != "gpt-5" {
+		t.Fatalf("summary.RequestedModel = %q, want %q", payload.Summary.RequestedModel, "gpt-5")
+	}
+}
+
+func TestTracingRequestSummariesStreamRoute(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "probe-secret")
+
+	ctx := context.Background()
+	store, err := tracingsqlite.New(ctx, tracingsqlite.Config{BaseDir: t.TempDir(), EmitSSE: true})
+	if err != nil {
+		t.Fatalf("failed to create tracing store: %v", err)
+	}
+	defer func() {
+		if errClose := store.Close(); errClose != nil {
+			t.Fatalf("failed to close tracing store: %v", errClose)
+		}
+	}()
+
+	previousRecorder := tracing.DefaultRecorder()
+	tracing.SetDefaultRecorder(store)
+	defer tracing.SetDefaultRecorder(previousRecorder)
+
+	server := newTestServer(t)
+
+	streamCtx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/tracing/request-summaries/stream", nil).WithContext(streamCtx)
+	req.Header.Set("X-Management-Key", "probe-secret")
+
+	rr := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.engine.ServeHTTP(rr, req)
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream handler did not exit after request cancellation")
+	}
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if got := rr.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want %q", got, "text/event-stream")
+	}
+	if body := rr.Body.String(); !strings.Contains(body, "event: ready\n") {
+		t.Fatalf("stream body missing ready event: %s", body)
+	}
+}
+
+func TestLegacyTracingRequestStreamRouteRemoved(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "probe-secret")
+
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/tracing/requests/stream", nil)
+	req.Header.Set("X-Management-Key", "probe-secret")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+	}
+}
+
+func TestTracingSSERouteRemoved(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "probe-secret")
+
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/tracing/sse", nil)
+	req.Header.Set("X-Management-Key", "probe-secret")
+
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
 	}
 }
 

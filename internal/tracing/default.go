@@ -28,17 +28,15 @@ func (disabledRecorder) FinalizeRequest(context.Context, RequestFinish) error   
 func (disabledRecorder) FinalizeUsage(context.Context, UsageFinal) error              { return nil }
 func (disabledRecorder) SaveBlob(context.Context, *BlobRecord) error                  { return nil }
 func (disabledRecorder) LatestSeq() int64                                             { return 0 }
-func (disabledRecorder) Subscribe() (<-chan int64, func()) {
-	ch := make(chan int64)
-	close(ch)
-	return ch, func() {}
-}
-func (disabledRecorder) Status(context.Context) (StatusRecord, error) { return StatusRecord{}, nil }
+func (disabledRecorder) Status(context.Context) (StatusRecord, error)                 { return StatusRecord{}, nil }
 func (disabledRecorder) ListEvents(context.Context, int64, int) ([]EventRecord, error) {
 	return nil, nil
 }
 func (disabledRecorder) ListRequestSummaries(context.Context, RequestSummaryFilter) (RequestSummaryPage, error) {
 	return RequestSummaryPage{}, nil
+}
+func (disabledRecorder) GetRequestSummary(context.Context, string) (*RequestSummaryRecord, error) {
+	return nil, nil
 }
 func (disabledRecorder) GetRequest(context.Context, string) (*RequestRecord, error) { return nil, nil }
 func (disabledRecorder) GetRequestDetail(context.Context, string) (*RequestDetailRecord, error) {

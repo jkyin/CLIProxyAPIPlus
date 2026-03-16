@@ -2,7 +2,6 @@ package management
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -59,6 +58,24 @@ func (h *Handler) GetTracingRequest(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"request": record})
+}
+
+func (h *Handler) GetTracingRequestSummary(c *gin.Context) {
+	if h == nil || h.tracingRecorder == nil || !h.tracingRecorder.Enabled() {
+		c.JSON(http.StatusNotFound, gin.H{"error": "tracing disabled"})
+		return
+	}
+	requestID := strings.TrimSpace(c.Param("request_id"))
+	record, err := h.tracingRecorder.GetRequestSummary(c.Request.Context(), requestID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if record == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "summary not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"summary": record})
 }
 
 func (h *Handler) GetTracingRequests(c *gin.Context) {
@@ -182,51 +199,7 @@ func (h *Handler) GetTracingBlob(c *gin.Context) {
 	})
 }
 
-func (h *Handler) TracingSSE(c *gin.Context) {
-	if h == nil || h.tracingRecorder == nil || !h.tracingRecorder.Enabled() {
-		c.JSON(http.StatusNotFound, gin.H{"error": "tracing disabled"})
-		return
-	}
-	ch, cancel := h.tracingRecorder.Subscribe()
-	defer cancel()
-
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Status(http.StatusOK)
-	flusher, ok := c.Writer.(http.Flusher)
-	if !ok {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming unsupported"})
-		return
-	}
-
-	latest := h.tracingRecorder.LatestSeq()
-	if latest > 0 {
-		_, _ = c.Writer.Write([]byte(fmt.Sprintf("event: ready\ndata: {\"latest_seq\":%d}\n\n", latest)))
-		flusher.Flush()
-	}
-	for {
-		select {
-		case <-c.Request.Context().Done():
-			return
-		case seq, ok := <-ch:
-			if !ok {
-				return
-			}
-			payload, _ := json.Marshal(gin.H{
-				"latest_seq": seq,
-				"ts":         time.Now().UTC().Format(time.RFC3339Nano),
-			})
-			_, _ = c.Writer.Write([]byte("event: seq\n"))
-			_, _ = c.Writer.Write([]byte("data: "))
-			_, _ = c.Writer.Write(payload)
-			_, _ = c.Writer.Write([]byte("\n\n"))
-			flusher.Flush()
-		}
-	}
-}
-
-func (h *Handler) TracingRequestsStream(c *gin.Context) {
+func (h *Handler) TracingRequestSummariesStream(c *gin.Context) {
 	if h == nil || h.tracingRecorder == nil || !h.tracingRecorder.Enabled() {
 		c.JSON(http.StatusNotFound, gin.H{"error": "tracing disabled"})
 		return
@@ -266,7 +239,7 @@ func (h *Handler) TracingRequestsStream(c *gin.Context) {
 			payload, _ := json.Marshal(event)
 			eventName := strings.TrimSpace(event.Type)
 			if eventName == "" {
-				eventName = tracing.RequestSummaryEventUpsert
+				eventName = tracing.RequestSummaryEventUpdated
 			}
 			_, _ = c.Writer.Write([]byte("event: " + eventName + "\n"))
 			_, _ = c.Writer.Write([]byte("data: "))
