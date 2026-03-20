@@ -1030,23 +1030,37 @@ func (s *Store) tableExists(ctx context.Context, name string) (bool, error) {
 
 func (s *Store) recoverRunning(ctx context.Context) error {
 	now := unixNS(time.Now().UTC())
-	if _, err := s.db.ExecContext(ctx, `
-		UPDATE trace_request
-		SET status = ?, finished_at_ns = CASE WHEN COALESCE(finished_at_ns, 0) = 0 THEN ? ELSE finished_at_ns END
-		WHERE status = ?
-	`, tracing.RequestStatusInterrupted, now, tracing.RequestStatusRunning); err != nil {
-		return err
-	}
-	if _, err := s.db.ExecContext(ctx, `
-		UPDATE trace_attempt
-		SET outcome = ?, finished_at_ns = CASE WHEN COALESCE(finished_at_ns, 0) = 0 THEN ? ELSE finished_at_ns END,
-			error_code = CASE WHEN COALESCE(error_code, '') = '' THEN 'interrupted' ELSE error_code END,
-			error_message = CASE WHEN COALESCE(error_message, '') = '' THEN 'process restarted before attempt finished' ELSE error_message END
-		WHERE outcome = ?
-	`, tracing.AttemptOutcomeInterrupted, now, tracing.AttemptOutcomeRunning); err != nil {
-		return err
-	}
-	return nil
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		requestIDs, err := recoverAffectedRequestIDs(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if len(requestIDs) == 0 {
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE trace_request
+			SET status = ?, finished_at_ns = CASE WHEN COALESCE(finished_at_ns, 0) = 0 THEN ? ELSE finished_at_ns END
+			WHERE status = ?
+		`, tracing.RequestStatusInterrupted, now, tracing.RequestStatusRunning); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE trace_attempt
+			SET outcome = ?, finished_at_ns = CASE WHEN COALESCE(finished_at_ns, 0) = 0 THEN ? ELSE finished_at_ns END,
+				error_code = CASE WHEN COALESCE(error_code, '') = '' THEN 'interrupted' ELSE error_code END,
+				error_message = CASE WHEN COALESCE(error_message, '') = '' THEN 'process restarted before attempt finished' ELSE error_message END
+			WHERE outcome = ?
+		`, tracing.AttemptOutcomeInterrupted, now, tracing.AttemptOutcomeRunning); err != nil {
+			return err
+		}
+		for _, requestID := range requestIDs {
+			if err := upsertRequestSummary(ctx, tx, requestID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (s *Store) prune(ctx context.Context, pruneDays int) error {
@@ -1440,6 +1454,35 @@ func upsertRequestSummary(ctx context.Context, tx *sql.Tx, requestID string) err
 type queryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func recoverAffectedRequestIDs(ctx context.Context, q queryer) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT DISTINCT request_id
+		FROM (
+			SELECT request_id FROM trace_request WHERE status = ?
+			UNION
+			SELECT request_id FROM trace_attempt WHERE outcome = ?
+		)
+		ORDER BY request_id ASC
+	`, tracing.RequestStatusRunning, tracing.AttemptOutcomeRunning)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var requestIDs []string
+	for rows.Next() {
+		var requestID string
+		if err := rows.Scan(&requestID); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(requestID) == "" {
+			continue
+		}
+		requestIDs = append(requestIDs, requestID)
+	}
+	return requestIDs, rows.Err()
 }
 
 func getRequestByQueryer(ctx context.Context, q queryer, requestID string) (*tracing.RequestRecord, error) {

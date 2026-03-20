@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/tracing"
 )
 
@@ -326,6 +328,293 @@ func TestStoreRequestSummaryEventLifecycle(t *testing.T) {
 	}
 	if deletedEvent.Summary != nil {
 		t.Fatalf("deleted event summary = %#v, want nil", deletedEvent.Summary)
+	}
+}
+
+func TestStoreRecoverRunningRefreshesRequestSummary(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	store, err := New(ctx, Config{BaseDir: dir})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	requestID := tracing.MustNewID()
+	attemptID := tracing.MustNewID()
+	startedAt := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Millisecond)
+
+	if err := store.StartRequest(ctx, tracing.RequestStart{
+		RequestID:      requestID,
+		StartedAt:      startedAt,
+		Method:         http.MethodPost,
+		Scheme:         "http",
+		Host:           "localhost:8317",
+		Path:           "/v1/chat/completions",
+		IsStream:       true,
+		HandlerType:    "openai",
+		RequestedModel: "gpt-5",
+	}); err != nil {
+		t.Fatalf("StartRequest() error = %v", err)
+	}
+
+	if err := store.BeginAttempt(ctx, tracing.AttemptStart{
+		RequestID:        requestID,
+		AttemptID:        attemptID,
+		AttemptNo:        1,
+		RetryScope:       "initial",
+		Provider:         "openai",
+		ExecutorID:       "openai",
+		AuthIndex:        "idx-3",
+		AuthSnapshotJSON: tracing.AuthSnapshotJSON("openai", "auth-1", "idx-3", "Work", "oauth", "jkyin@example.com", "/tmp/auth.json", "file", "ready", false, time.Time{}),
+		RouteModel:       "gpt-5",
+		UpstreamModel:    "gpt-5.4",
+		StartedAt:        startedAt.Add(10 * time.Millisecond),
+	}); err != nil {
+		t.Fatalf("BeginAttempt() error = %v", err)
+	}
+
+	if err := store.FinalizeUsage(ctx, tracing.UsageFinal{
+		RequestID:       requestID,
+		AttemptID:       attemptID,
+		FinalizedAt:     startedAt.Add(20 * time.Millisecond),
+		Status:          "success",
+		Completeness:    tracing.UsageCompletenessComplete,
+		InputTokens:     11,
+		OutputTokens:    29,
+		ReasoningTokens: 3,
+		CachedTokens:    1,
+		TotalTokens:     40,
+	}); err != nil {
+		t.Fatalf("FinalizeUsage() error = %v", err)
+	}
+
+	preRecoverySummary, err := store.GetRequestSummary(ctx, requestID)
+	if err != nil {
+		t.Fatalf("GetRequestSummary() before restart error = %v", err)
+	}
+	if preRecoverySummary == nil {
+		t.Fatal("GetRequestSummary() before restart = nil, want summary")
+	}
+	if preRecoverySummary.RequestStatus != tracing.RequestStatusRunning {
+		t.Fatalf("pre-recovery summary request_status = %q, want %q", preRecoverySummary.RequestStatus, tracing.RequestStatusRunning)
+	}
+	if preRecoverySummary.DurationMS == nil || *preRecoverySummary.DurationMS != 0 {
+		t.Fatalf("pre-recovery summary duration_ms = %#v, want 0", preRecoverySummary.DurationMS)
+	}
+	preRecoveryUpdatedAtNS := preRecoverySummary.UpdatedAtNS
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() before restart error = %v", err)
+	}
+
+	store, err = New(ctx, Config{BaseDir: dir})
+	if err != nil {
+		t.Fatalf("New() after restart error = %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	requestRecord, err := store.GetRequest(ctx, requestID)
+	if err != nil {
+		t.Fatalf("GetRequest() after restart error = %v", err)
+	}
+	if requestRecord == nil {
+		t.Fatal("GetRequest() after restart = nil, want request")
+	}
+	if requestRecord.Status != tracing.RequestStatusInterrupted {
+		t.Fatalf("request status after restart = %q, want %q", requestRecord.Status, tracing.RequestStatusInterrupted)
+	}
+	if requestRecord.FinishedAtNS <= requestRecord.StartedAtNS {
+		t.Fatalf("request finished_at_ns after restart = %d, want > started_at_ns %d", requestRecord.FinishedAtNS, requestRecord.StartedAtNS)
+	}
+
+	attempts, err := store.ListAttempts(ctx, requestID)
+	if err != nil {
+		t.Fatalf("ListAttempts() after restart error = %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("ListAttempts() len after restart = %d, want 1", len(attempts))
+	}
+	if attempts[0].Outcome != tracing.AttemptOutcomeInterrupted {
+		t.Fatalf("attempt outcome after restart = %q, want %q", attempts[0].Outcome, tracing.AttemptOutcomeInterrupted)
+	}
+	if attempts[0].FinishedAtNS <= attempts[0].StartedAtNS {
+		t.Fatalf("attempt finished_at_ns after restart = %d, want > started_at_ns %d", attempts[0].FinishedAtNS, attempts[0].StartedAtNS)
+	}
+
+	summary, err := store.GetRequestSummary(ctx, requestID)
+	if err != nil {
+		t.Fatalf("GetRequestSummary() after restart error = %v", err)
+	}
+	if summary == nil {
+		t.Fatal("GetRequestSummary() after restart = nil, want summary")
+	}
+	if summary.RequestStatus != tracing.RequestStatusInterrupted {
+		t.Fatalf("summary request_status after restart = %q, want %q", summary.RequestStatus, tracing.RequestStatusInterrupted)
+	}
+	if summary.DurationMS == nil || *summary.DurationMS <= 0 {
+		t.Fatalf("summary duration_ms after restart = %#v, want > 0", summary.DurationMS)
+	}
+	if summary.UpdatedAtNS <= preRecoveryUpdatedAtNS {
+		t.Fatalf("summary updated_at_ns after restart = %d, want > %d", summary.UpdatedAtNS, preRecoveryUpdatedAtNS)
+	}
+	if summary.Provider != "openai" || summary.AuthLabel != "Work" || summary.UpstreamModel != "gpt-5.4" {
+		t.Fatalf("summary after restart = %#v, want preserved provider/auth/attempt fields", summary)
+	}
+	if summary.TotalTokens == nil || *summary.TotalTokens != 40 {
+		t.Fatalf("summary total_tokens after restart = %#v, want 40", summary.TotalTokens)
+	}
+	if summary.UsageCompleteness != tracing.UsageCompletenessComplete {
+		t.Fatalf("summary usage_completeness after restart = %q, want %q", summary.UsageCompleteness, tracing.UsageCompletenessComplete)
+	}
+
+	page, err := store.ListRequestSummaries(ctx, tracing.RequestSummaryFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListRequestSummaries() after restart error = %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("ListRequestSummaries() len after restart = %d, want 1", len(page.Items))
+	}
+	if page.Items[0].RequestID != requestID {
+		t.Fatalf("ListRequestSummaries() request_id after restart = %q, want %q", page.Items[0].RequestID, requestID)
+	}
+	if page.Items[0].RequestStatus != tracing.RequestStatusInterrupted {
+		t.Fatalf("ListRequestSummaries() request_status after restart = %q, want %q", page.Items[0].RequestStatus, tracing.RequestStatusInterrupted)
+	}
+}
+
+func TestStoreRequestSummarySuccessfulRetryUsageIsComplete(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := New(ctx, Config{BaseDir: dir, EmitSSE: true})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	ch, cancel := store.SubscribeRequestSummaries()
+	defer cancel()
+
+	requestID := tracing.MustNewID()
+	startedAt := time.Now().UTC()
+	if err := store.StartRequest(ctx, tracing.RequestStart{
+		RequestID:      requestID,
+		StartedAt:      startedAt,
+		Method:         http.MethodPost,
+		Scheme:         "http",
+		Host:           "localhost:8317",
+		Path:           "/v1/chat/completions",
+		RequestHeaders: http.Header{"Content-Type": {"application/json"}},
+		IsStream:       true,
+		HandlerType:    "openai",
+		RequestedModel: "gpt-5",
+	}); err != nil {
+		t.Fatalf("StartRequest() error = %v", err)
+	}
+
+	reqRecorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(reqRecorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "http://example.test/v1/chat/completions", nil)
+
+	state := tracing.NewRequestState(store, requestID, "", startedAt)
+	tracing.AttachRequestState(ginCtx, state)
+	requestCtx := ginCtx.Request.Context()
+
+	attempt1Ctx, _, err := tracing.StartAttempt(requestCtx, tracing.AttemptStart{
+		RetryScope: "initial",
+		Provider:   "test-provider",
+		ExecutorID: "test-executor",
+		StartedAt:  startedAt.Add(10 * time.Millisecond),
+	})
+	if err != nil {
+		t.Fatalf("StartAttempt(first) error = %v", err)
+	}
+	tracing.ObserveUsage(attempt1Ctx, tracing.UsageObservation{
+		InputTokens:      10,
+		OutputTokens:     5,
+		IsTerminal:       true,
+		CompletenessHint: tracing.UsageCompletenessComplete,
+	})
+	tracing.FinishAttempt(attempt1Ctx, tracing.AttemptFinish{
+		Outcome:    tracing.AttemptOutcomeFailed,
+		FinishedAt: startedAt.Add(20 * time.Millisecond),
+	})
+
+	attempt2Ctx, _, err := tracing.StartAttempt(requestCtx, tracing.AttemptStart{
+		RetryScope: "executor_internal_retry",
+		Provider:   "test-provider",
+		ExecutorID: "test-executor",
+		StartedAt:  startedAt.Add(30 * time.Millisecond),
+	})
+	if err != nil {
+		t.Fatalf("StartAttempt(second) error = %v", err)
+	}
+	tracing.ObserveUsage(attempt2Ctx, tracing.UsageObservation{
+		InputTokens:      12,
+		OutputTokens:     6,
+		IsTerminal:       true,
+		CompletenessHint: tracing.UsageCompletenessComplete,
+	})
+	tracing.FinishAttempt(attempt2Ctx, tracing.AttemptFinish{
+		Outcome:    tracing.AttemptOutcomeSucceeded,
+		FinishedAt: startedAt.Add(40 * time.Millisecond),
+	})
+
+	tracing.FinalizeRequest(requestCtx, tracing.RequestFinish{
+		RequestID:  requestID,
+		StatusCode: 200,
+		Status:     tracing.RequestStatusSucceeded,
+		FinishedAt: startedAt.Add(50 * time.Millisecond),
+	})
+
+	var endedEvent tracing.RequestSummaryEvent
+	foundEnded := false
+	for i := 0; i < 8; i++ {
+		event := readRequestSummaryEvent(t, ch)
+		if event.Type == tracing.RequestSummaryEventEnded {
+			endedEvent = event
+			foundEnded = true
+			break
+		}
+	}
+	if !foundEnded {
+		t.Fatal("did not receive ended request summary event")
+	}
+	if endedEvent.RequestStatus != tracing.RequestStatusSucceeded {
+		t.Fatalf("ended event request_status = %q, want %q", endedEvent.RequestStatus, tracing.RequestStatusSucceeded)
+	}
+	if endedEvent.Summary == nil {
+		t.Fatal("ended event summary = nil, want summary")
+	}
+	if endedEvent.Summary.UsageCompleteness != tracing.UsageCompletenessComplete {
+		t.Fatalf("ended event usage_completeness = %q, want %q", endedEvent.Summary.UsageCompleteness, tracing.UsageCompletenessComplete)
+	}
+
+	usageRecord, err := store.GetUsage(ctx, requestID)
+	if err != nil {
+		t.Fatalf("GetUsage() error = %v", err)
+	}
+	if usageRecord == nil {
+		t.Fatal("GetUsage() = nil, want record")
+	}
+	if usageRecord.Completeness != tracing.UsageCompletenessComplete {
+		t.Fatalf("GetUsage().Completeness = %q, want %q", usageRecord.Completeness, tracing.UsageCompletenessComplete)
+	}
+
+	attempts, err := store.ListAttempts(ctx, requestID)
+	if err != nil {
+		t.Fatalf("ListAttempts() error = %v", err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("ListAttempts() len = %d, want 2", len(attempts))
+	}
+	if attempts[0].Outcome != tracing.AttemptOutcomeFailed || attempts[1].Outcome != tracing.AttemptOutcomeSucceeded {
+		t.Fatalf("ListAttempts() outcomes = [%q, %q], want [failed, succeeded]", attempts[0].Outcome, attempts[1].Outcome)
+	}
+	if usageRecord.AttemptID != attempts[1].AttemptID {
+		t.Fatalf("GetUsage().AttemptID = %q, want %q", usageRecord.AttemptID, attempts[1].AttemptID)
 	}
 }
 
