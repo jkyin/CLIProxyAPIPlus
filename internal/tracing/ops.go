@@ -73,6 +73,7 @@ func FinishAttempt(ctx context.Context, finish AttemptFinish) {
 	if finish.Outcome == "" {
 		finish.Outcome = AttemptOutcomeFailed
 	}
+	state.RecordAttemptOutcome(finish.AttemptID, finish.Outcome)
 	if attempt.respCollector != nil && finish.Outcome != AttemptOutcomeRunning {
 		record, err := attempt.respCollector.Close(finish.Outcome == AttemptOutcomeSucceeded)
 		if err == nil && record != nil {
@@ -146,16 +147,6 @@ func ObserveUsage(ctx context.Context, obs UsageObservation) {
 	_ = state.recorder.RecordRequestEvent(ctx, state.requestID, obs.AttemptID, EventUsageObserved, obs.ObservedAt, usageObservationPayload(obs))
 }
 
-func MarkUsageFailed(ctx context.Context) {
-	state := RequestStateFromContext(ctx)
-	if state == nil {
-		return
-	}
-	state.mu.Lock()
-	state.usage.MarkFailed()
-	state.mu.Unlock()
-}
-
 func RecordHandlerBootstrapRetry(ctx context.Context, payload map[string]any) {
 	state := RequestStateFromContext(ctx)
 	if state == nil || state.recorder == nil || !state.recorder.Enabled() {
@@ -197,7 +188,7 @@ func FinalizeRequest(ctx context.Context, finish RequestFinish) {
 		"status":                 finish.Status,
 		"downstream_status_code": finish.StatusCode,
 	})
-	if usage := state.FinalizeUsage(); usage != nil {
+	if usage := state.FinalizeUsage(finish.Status); usage != nil {
 		_ = state.recorder.FinalizeUsage(ctx, *usage)
 		_ = state.recorder.RecordRequestEvent(ctx, state.requestID, usage.AttemptID, EventUsageFinalized, usage.FinalizedAt, usageFinalPayload(*usage))
 	}

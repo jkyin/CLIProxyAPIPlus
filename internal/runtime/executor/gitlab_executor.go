@@ -85,7 +85,7 @@ func (e *GitLabExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	responseModel := gitLabResolvedModel(auth, req.Model)
 	openAIResponse := buildGitLabOpenAIResponse(responseModel, text, translated)
-	reporter.publish(ctx, parseOpenAIUsage(openAIResponse))
+	reporter.publish(ctx, usageTerminal(parseOpenAIUsage(openAIResponse)))
 	reporter.ensurePublished(ctx)
 
 	var param any
@@ -132,7 +132,7 @@ func (e *GitLabExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	responseModel := gitLabResolvedModel(auth, req.Model)
 	openAIResponse := buildGitLabOpenAIResponse(responseModel, text, translated)
-	reporter.publish(ctx, parseOpenAIUsage(openAIResponse))
+	reporter.publish(ctx, usageTerminal(parseOpenAIUsage(openAIResponse)))
 	reporter.ensurePublished(ctx)
 
 	out := make(chan cliproxyexecutor.StreamChunk, 8)
@@ -390,7 +390,7 @@ func (e *GitLabExecutor) requestCodeSuggestionsStream(
 			eventName = ""
 			for _, item := range normalized {
 				if detail, ok := parseOpenAIStreamUsage(item); ok {
-					reporter.publish(ctx, detail)
+					reporter.publish(ctx, usageTerminal(detail))
 				}
 				chunks := sdktranslator.TranslateStream(
 					ctx,

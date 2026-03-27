@@ -237,6 +237,8 @@ Completeness values:
 
 Rules:
 
+- `complete` means the final request succeeded and the selected usage observation belongs to the successful attempt, or is an explicit terminal usage observation
+- `partial` means usage was observed, but it cannot be proven to represent the final successful request's complete usage conclusion
 - `missing` is not the same as zero tokens
 - when `completeness=missing`, token columns in `trace_usage_final` are stored as `NULL`
 - the management usage API and `usage.finalized` payload also emit `null` token fields for `missing`

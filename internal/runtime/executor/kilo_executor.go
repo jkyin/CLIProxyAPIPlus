@@ -158,7 +158,7 @@ func (e *KiloExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 	appendAPIResponseChunk(ctx, e.cfg, body)
-	reporter.publish(ctx, parseOpenAIUsage(body))
+	reporter.publish(ctx, usageTerminal(parseOpenAIUsage(body)))
 	reporter.ensurePublished(ctx)
 
 	var param any
@@ -264,7 +264,7 @@ func (e *KiloExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := parseOpenAIStreamUsage(line); ok {
-				reporter.publish(ctx, detail)
+				reporter.publish(ctx, usageTerminal(detail))
 			}
 			if len(line) == 0 {
 				continue

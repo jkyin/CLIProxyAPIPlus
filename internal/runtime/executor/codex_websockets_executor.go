@@ -339,7 +339,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		eventType := gjson.GetBytes(payload, "type").String()
 		if eventType == "response.completed" {
 			if detail, ok := parseCodexUsage(payload); ok {
-				reporter.publish(ctx, detail)
+				reporter.publish(ctx, usageTerminal(detail))
 			}
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, payload, &param)
@@ -585,7 +585,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			eventType := gjson.GetBytes(payload, "type").String()
 			if eventType == "response.completed" || eventType == "response.done" {
 				if detail, ok := parseCodexUsage(payload); ok {
-					reporter.publish(ctx, detail)
+					reporter.publish(ctx, usageTerminal(detail))
 				}
 			}
 

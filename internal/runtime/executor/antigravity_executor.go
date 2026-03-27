@@ -305,7 +305,7 @@ attemptLoop:
 				return resp, err
 			}
 
-			reporter.publish(ctx, parseAntigravityUsage(bodyBytes))
+			reporter.publish(ctx, usageTerminal(parseAntigravityUsage(bodyBytes)))
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bodyBytes, &param)
 			resp = cliproxyexecutor.Response{Payload: []byte(converted), Headers: httpResp.Header.Clone()}
@@ -483,7 +483,7 @@ attemptLoop:
 					}
 
 					if detail, ok := parseAntigravityStreamUsage(payload); ok {
-						reporter.publish(ctx, detail)
+						reporter.publish(ctx, usageCandidate(detail))
 					}
 
 					out <- cliproxyexecutor.StreamChunk{Payload: payload}
@@ -509,7 +509,7 @@ attemptLoop:
 			}
 			resp = cliproxyexecutor.Response{Payload: e.convertStreamToNonStream(buffer.Bytes())}
 
-			reporter.publish(ctx, parseAntigravityUsage(resp.Payload))
+			reporter.publish(ctx, usageTerminal(parseAntigravityUsage(resp.Payload)))
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, resp.Payload, &param)
 			resp = cliproxyexecutor.Response{Payload: []byte(converted), Headers: httpResp.Header.Clone()}
@@ -875,7 +875,7 @@ attemptLoop:
 					}
 
 					if detail, ok := parseAntigravityStreamUsage(payload); ok {
-						reporter.publish(ctx, detail)
+						reporter.publish(ctx, usageCandidate(detail))
 					}
 
 					chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(payload), &param)

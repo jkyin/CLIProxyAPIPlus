@@ -217,7 +217,7 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 		detail = parseOpenAIResponsesUsage(data)
 	}
 	if detail.TotalTokens > 0 {
-		reporter.publish(ctx, detail)
+		reporter.publish(ctx, usageTerminal(detail))
 	}
 
 	var param any
@@ -366,10 +366,10 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 					continue
 				}
 				if detail, ok := parseOpenAIStreamUsage(line); ok {
-					reporter.publish(ctx, detail)
+					reporter.publish(ctx, usageTerminal(detail))
 				} else if useResponses {
 					if detail, ok := parseOpenAIResponsesStreamUsage(line); ok {
-						reporter.publish(ctx, detail)
+						reporter.publish(ctx, usageTerminal(detail))
 					}
 				}
 			}

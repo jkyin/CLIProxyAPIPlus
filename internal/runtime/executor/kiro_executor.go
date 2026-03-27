@@ -1001,7 +1001,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			usageInfo.TotalTokens = usageInfo.InputTokens + usageInfo.OutputTokens
 
 			appendAPIResponseChunk(ctx, e.cfg, []byte(content))
-			reporter.publish(ctx, usageInfo)
+			reporter.publish(ctx, usageTerminal(usageInfo))
 
 			// Record success for rate limiting
 			rateLimiter.MarkTokenSuccess(tokenKey)
@@ -2534,7 +2534,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 	// Ensure usage is published even on early return
 	defer func() {
-		reporter.publish(ctx, totalUsage)
+		reporter.publish(ctx, usageTerminal(totalUsage))
 	}()
 
 	for {
@@ -4403,7 +4403,7 @@ func (e *KiroExecutor) handleWebSearchStream(
 			if accumulatedOutputLen > 0 && totalUsage.OutputTokens == 0 {
 				totalUsage.OutputTokens = 1
 			}
-			reporter.publish(ctx, totalUsage)
+			reporter.publish(ctx, usageTerminal(totalUsage))
 		}()
 
 		// Send message_start event to client (aligned with streamToChannel pattern)

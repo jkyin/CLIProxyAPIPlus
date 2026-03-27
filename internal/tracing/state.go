@@ -183,10 +183,16 @@ func (s *RequestState) ObserveUsage(obs UsageObservation) {
 	s.usage.Observe(obs)
 }
 
-func (s *RequestState) FinalizeUsage() *UsageFinal {
+func (s *RequestState) RecordAttemptOutcome(attemptID, outcome string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.usage.Finalize(s.requestID)
+	s.usage.RecordAttemptOutcome(attemptID, outcome)
+}
+
+func (s *RequestState) FinalizeUsage(requestStatus string) *UsageFinal {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.usage.Finalize(s.requestID, requestStatus)
 }
 
 func (a *AttemptState) EnsureResponseCollector(config BlobConfig) (*BlobCollector, error) {
@@ -302,10 +308,12 @@ func MustNewID() string {
 type UsageAccumulator struct {
 	latestCandidate *UsageObservation
 	latestTerminal  *UsageObservation
-	failed          bool
+	attemptOutcomes map[string]string
 }
 
-func NewUsageAccumulator() *UsageAccumulator { return &UsageAccumulator{} }
+func NewUsageAccumulator() *UsageAccumulator {
+	return &UsageAccumulator{attemptOutcomes: make(map[string]string)}
+}
 
 func (u *UsageAccumulator) Observe(obs UsageObservation) {
 	copyObs := obs
@@ -325,40 +333,74 @@ func (u *UsageAccumulator) Observe(obs UsageObservation) {
 	}
 }
 
-func (u *UsageAccumulator) MarkFailed() { u.failed = true }
-
-func (u *UsageAccumulator) Finalize(requestID string) *UsageFinal {
-	finalizedAt := time.Now().UTC()
-	if u.latestTerminal != nil {
-		return usageFinalFromObservation(requestID, *u.latestTerminal, UsageCompletenessComplete, finalizedAt)
+func (u *UsageAccumulator) RecordAttemptOutcome(attemptID, outcome string) {
+	if attemptID == "" || outcome == "" {
+		return
 	}
-	if u.latestCandidate != nil {
-		if u.latestCandidate.CompletenessHint == UsageCompletenessMissing &&
-			u.latestCandidate.InputTokens == 0 &&
-			u.latestCandidate.OutputTokens == 0 &&
-			u.latestCandidate.ReasoningTokens == 0 &&
-			u.latestCandidate.CachedTokens == 0 &&
-			u.latestCandidate.TotalTokens == 0 {
+	if u.attemptOutcomes == nil {
+		u.attemptOutcomes = make(map[string]string)
+	}
+	u.attemptOutcomes[attemptID] = outcome
+}
+
+func (u *UsageAccumulator) Finalize(requestID string, requestStatus string) *UsageFinal {
+	finalizedAt := time.Now().UTC()
+	if requestStatus == "" {
+		requestStatus = RequestStatusSucceeded
+	}
+	selected := u.latestTerminal
+	if selected == nil {
+		selected = u.latestCandidate
+	}
+	if selected != nil {
+		if usageObservationIsMissing(*selected) {
 			return &UsageFinal{
 				RequestID:    requestID,
-				AttemptID:    u.latestCandidate.AttemptID,
+				AttemptID:    selected.AttemptID,
 				FinalizedAt:  finalizedAt,
-				Status:       boolToUsageStatus(!u.failed),
+				Status:       boolToUsageStatus(requestStatus == RequestStatusSucceeded),
 				Completeness: UsageCompletenessMissing,
 			}
 		}
-		completeness := UsageCompletenessComplete
-		if u.failed {
-			completeness = UsageCompletenessPartial
-		}
-		return usageFinalFromObservation(requestID, *u.latestCandidate, completeness, finalizedAt)
+		return usageFinalFromObservation(
+			requestID,
+			*selected,
+			u.completenessForObservation(*selected, requestStatus),
+			finalizedAt,
+		)
 	}
 	return &UsageFinal{
 		RequestID:    requestID,
 		FinalizedAt:  finalizedAt,
-		Status:       boolToUsageStatus(!u.failed),
+		Status:       boolToUsageStatus(requestStatus == RequestStatusSucceeded),
 		Completeness: UsageCompletenessMissing,
 	}
+}
+
+func (u *UsageAccumulator) completenessForObservation(obs UsageObservation, requestStatus string) string {
+	if usageObservationIsMissing(obs) {
+		return UsageCompletenessMissing
+	}
+	if requestStatus != RequestStatusSucceeded {
+		return UsageCompletenessPartial
+	}
+	if obs.AttemptID == "" {
+		return UsageCompletenessComplete
+	}
+	outcome := u.attemptOutcomes[obs.AttemptID]
+	if outcome == "" || outcome == AttemptOutcomeSucceeded {
+		return UsageCompletenessComplete
+	}
+	return UsageCompletenessPartial
+}
+
+func usageObservationIsMissing(obs UsageObservation) bool {
+	return obs.CompletenessHint == UsageCompletenessMissing &&
+		obs.InputTokens == 0 &&
+		obs.OutputTokens == 0 &&
+		obs.ReasoningTokens == 0 &&
+		obs.CachedTokens == 0 &&
+		obs.TotalTokens == 0
 }
 
 func usageFinalFromObservation(requestID string, obs UsageObservation, completeness string, finalizedAt time.Time) *UsageFinal {

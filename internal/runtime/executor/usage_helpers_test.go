@@ -69,14 +69,14 @@ func TestEnsurePublishedDoesNotOverrideObservedUsage(t *testing.T) {
 
 	requestCtx := ginCtx.Request.Context()
 	reporter := newUsageReporter(requestCtx, "test-provider", "test-model", nil)
-	reporter.publish(requestCtx, usage.Detail{
+	reporter.publish(requestCtx, usageCandidate(usage.Detail{
 		InputTokens:  13,
 		OutputTokens: 335,
 		TotalTokens:  348,
-	})
+	}))
 	reporter.ensurePublished(requestCtx)
 
-	final := state.FinalizeUsage()
+	final := state.FinalizeUsage(tracing.RequestStatusSucceeded)
 	if final == nil {
 		t.Fatal("FinalizeUsage() = nil, want usage")
 	}
@@ -85,5 +85,37 @@ func TestEnsurePublishedDoesNotOverrideObservedUsage(t *testing.T) {
 	}
 	if final.InputTokens != 13 || final.OutputTokens != 335 || final.TotalTokens != 348 {
 		t.Fatalf("FinalizeUsage() = %+v, want prompt=13 completion=335 total=348", *final)
+	}
+}
+
+func TestEnsurePublishedWithoutObservedUsageProducesMissing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	ctx := t.Context()
+	store, err := tracingsqlite.New(ctx, tracingsqlite.Config{BaseDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("tracing sqlite New() error = %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	state := tracing.NewRequestState(store, tracing.MustNewID(), "", time.Now().UTC())
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest("POST", "http://example.test/v1/chat/completions", nil)
+	tracing.AttachRequestState(ginCtx, state)
+
+	requestCtx := ginCtx.Request.Context()
+	reporter := newUsageReporter(requestCtx, "test-provider", "test-model", nil)
+	reporter.ensurePublished(requestCtx)
+
+	final := state.FinalizeUsage(tracing.RequestStatusSucceeded)
+	if final == nil {
+		t.Fatal("FinalizeUsage() = nil, want usage")
+	}
+	if final.Completeness != tracing.UsageCompletenessMissing {
+		t.Fatalf("FinalizeUsage().Completeness = %q, want %q", final.Completeness, tracing.UsageCompletenessMissing)
+	}
+	if final.Status != "success" {
+		t.Fatalf("FinalizeUsage().Status = %q, want success", final.Status)
 	}
 }

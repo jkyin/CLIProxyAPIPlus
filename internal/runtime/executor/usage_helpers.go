@@ -29,6 +29,31 @@ type usageReporter struct {
 	observed    atomic.Bool
 }
 
+type UsageSignal struct {
+	Detail           usage.Detail
+	IsTerminal       bool
+	CompletenessHint string
+}
+
+func usageCandidate(detail usage.Detail) UsageSignal {
+	return UsageSignal{
+		Detail:           detail,
+		CompletenessHint: tracing.UsageCompletenessPartial,
+	}
+}
+
+func usageTerminal(detail usage.Detail) UsageSignal {
+	return UsageSignal{
+		Detail:           detail,
+		IsTerminal:       true,
+		CompletenessHint: tracing.UsageCompletenessComplete,
+	}
+}
+
+func usageMissingSignal() UsageSignal {
+	return UsageSignal{CompletenessHint: tracing.UsageCompletenessMissing}
+}
+
 func newUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *usageReporter {
 	apiKey := apiKeyFromContext(ctx)
 	reporter := &usageReporter{
@@ -45,12 +70,11 @@ func newUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 	return reporter
 }
 
-func (r *usageReporter) publish(ctx context.Context, detail usage.Detail) {
-	r.publishWithOutcome(ctx, detail, false)
+func (r *usageReporter) publish(ctx context.Context, signal UsageSignal) {
+	r.publishWithOutcome(ctx, signal, false)
 }
 
 func (r *usageReporter) publishFailure(ctx context.Context) {
-	tracing.MarkUsageFailed(ctx)
 	if r == nil {
 		return
 	}
@@ -78,31 +102,32 @@ func (r *usageReporter) trackFailure(ctx context.Context, errPtr *error) {
 	}
 }
 
-func (r *usageReporter) publishWithOutcome(ctx context.Context, detail usage.Detail, failed bool) {
+func (r *usageReporter) publishWithOutcome(ctx context.Context, signal UsageSignal, failed bool) {
 	if r == nil {
 		return
 	}
+	detail := signal.Detail
 	if detail.TotalTokens == 0 {
 		total := detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
 		if total > 0 {
 			detail.TotalTokens = total
 		}
 	}
-	if detail.InputTokens == 0 && detail.OutputTokens == 0 && detail.ReasoningTokens == 0 && detail.CachedTokens == 0 && detail.TotalTokens == 0 && !failed {
+	hint := strings.TrimSpace(signal.CompletenessHint)
+	if hint == "" {
+		if signal.IsTerminal {
+			hint = tracing.UsageCompletenessComplete
+		} else {
+			hint = tracing.UsageCompletenessPartial
+		}
+	}
+	if detail.InputTokens == 0 && detail.OutputTokens == 0 && detail.ReasoningTokens == 0 && detail.CachedTokens == 0 && detail.TotalTokens == 0 && !failed && hint != tracing.UsageCompletenessMissing {
 		return
 	}
-	r.observed.Store(true)
-	tracing.ObserveUsage(ctx, tracing.UsageObservation{
-		Provider:         r.provider,
-		ObservedAt:       time.Now().UTC(),
-		InputTokens:      detail.InputTokens,
-		OutputTokens:     detail.OutputTokens,
-		ReasoningTokens:  detail.ReasoningTokens,
-		CachedTokens:     detail.CachedTokens,
-		TotalTokens:      detail.TotalTokens,
-		DerivedTotal:     detail.TotalTokens == detail.InputTokens+detail.OutputTokens+detail.ReasoningTokens && detail.TotalTokens > 0,
-		IsTerminal:       false,
-		CompletenessHint: tracing.UsageCompletenessPartial,
+	r.observe(ctx, UsageSignal{
+		Detail:           detail,
+		IsTerminal:       signal.IsTerminal,
+		CompletenessHint: hint,
 	})
 	r.once.Do(func() {
 		usage.PublishRecord(ctx, usage.Record{
@@ -119,6 +144,32 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	})
 }
 
+func (r *usageReporter) observe(ctx context.Context, signal UsageSignal) {
+	hint := strings.TrimSpace(signal.CompletenessHint)
+	if hint == "" {
+		if signal.IsTerminal {
+			hint = tracing.UsageCompletenessComplete
+		} else {
+			hint = tracing.UsageCompletenessPartial
+		}
+	}
+	if hint != tracing.UsageCompletenessMissing {
+		r.observed.Store(true)
+	}
+	tracing.ObserveUsage(ctx, tracing.UsageObservation{
+		Provider:         r.provider,
+		ObservedAt:       time.Now().UTC(),
+		InputTokens:      signal.Detail.InputTokens,
+		OutputTokens:     signal.Detail.OutputTokens,
+		ReasoningTokens:  signal.Detail.ReasoningTokens,
+		CachedTokens:     signal.Detail.CachedTokens,
+		TotalTokens:      signal.Detail.TotalTokens,
+		DerivedTotal:     signal.Detail.TotalTokens == signal.Detail.InputTokens+signal.Detail.OutputTokens+signal.Detail.ReasoningTokens && signal.Detail.TotalTokens > 0,
+		IsTerminal:       signal.IsTerminal,
+		CompletenessHint: hint,
+	})
+}
+
 // ensurePublished guarantees that a usage record is emitted exactly once.
 // It is safe to call multiple times; only the first call wins due to once.Do.
 // This is used to ensure request counting even when upstream responses do not
@@ -127,11 +178,7 @@ func (r *usageReporter) ensurePublished(ctx context.Context) {
 	if r == nil || r.observed.Load() {
 		return
 	}
-	tracing.ObserveUsage(ctx, tracing.UsageObservation{
-		Provider:         r.provider,
-		ObservedAt:       time.Now().UTC(),
-		CompletenessHint: tracing.UsageCompletenessMissing,
-	})
+	r.observe(ctx, usageMissingSignal())
 	r.once.Do(func() {
 		usage.PublishRecord(ctx, usage.Record{
 			Provider:    r.provider,
