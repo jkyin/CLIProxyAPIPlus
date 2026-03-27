@@ -95,6 +95,7 @@ func main() {
 	var kiroIDCRegion string
 	var kiroIDCFlow string
 	var githubCopilotLogin bool
+	var codeBuddyLogin bool
 	var projectID string
 	var vertexImport string
 	var configPath string
@@ -103,6 +104,7 @@ func main() {
 	var standalone bool
 	var noIncognito bool
 	var useIncognito bool
+	var localModel bool
 
 	// Define command-line flags for different operation modes.
 	flag.BoolVar(&login, "login", false, "Login Google Account")
@@ -131,12 +133,14 @@ func main() {
 	flag.StringVar(&kiroIDCRegion, "kiro-idc-region", "", "IDC region (default: us-east-1)")
 	flag.StringVar(&kiroIDCFlow, "kiro-idc-flow", "", "IDC flow type: authcode (default) or device")
 	flag.BoolVar(&githubCopilotLogin, "github-copilot-login", false, "Login to GitHub Copilot using device flow")
+	flag.BoolVar(&codeBuddyLogin, "codebuddy-login", false, "Login to CodeBuddy using browser OAuth flow")
 	flag.StringVar(&projectID, "project_id", "", "Project ID (Gemini only, not required)")
 	flag.StringVar(&configPath, "config", DefaultConfigPath, "Configure File Path")
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
 	flag.StringVar(&password, "password", "", "")
 	flag.BoolVar(&tuiMode, "tui", false, "Start with terminal management UI")
 	flag.BoolVar(&standalone, "standalone", false, "In TUI mode, start an embedded local server")
+	flag.BoolVar(&localModel, "local-model", false, "Use embedded model catalog only, skip remote model fetching")
 
 	flag.CommandLine.Usage = func() {
 		out := flag.CommandLine.Output()
@@ -514,6 +518,9 @@ func main() {
 	} else if githubCopilotLogin {
 		// Handle GitHub Copilot login
 		cmd.DoGitHubCopilotLogin(cfg, options)
+	} else if codeBuddyLogin {
+		// Handle CodeBuddy login
+		cmd.DoCodeBuddyLogin(cfg, options)
 	} else if codexLogin {
 		// Handle Codex login
 		cmd.DoCodexLogin(cfg, options)
@@ -578,11 +585,16 @@ func main() {
 			cmd.WaitForCloudDeploy()
 			return
 		}
+		if localModel && (!tuiMode || standalone) {
+			log.Info("Local model mode: using embedded model catalog, remote model updates disabled")
+		}
 		if tuiMode {
 			if standalone {
 				// Standalone mode: start an embedded local server and connect TUI client to it.
 				managementasset.StartAutoUpdater(context.Background(), configFilePath)
-				registry.StartModelsUpdater(context.Background())
+				if !localModel {
+					registry.StartModelsUpdater(context.Background())
+				}
 				hook := tui.NewLogHook(2000)
 				hook.SetFormatter(&logging.LogFormatter{})
 				log.AddHook(hook)
@@ -655,7 +667,9 @@ func main() {
 		} else {
 			// Start the main proxy service
 			managementasset.StartAutoUpdater(context.Background(), configFilePath)
-			registry.StartModelsUpdater(context.Background())
+			if !localModel {
+				registry.StartModelsUpdater(context.Background())
+			}
 
 			if cfg.AuthDir != "" {
 				kiro.InitializeAndStart(cfg.AuthDir, cfg)
